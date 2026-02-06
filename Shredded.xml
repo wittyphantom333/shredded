@@ -1,0 +1,151 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+    xsi:schemaLocation="http://www.blizzard.com/wow/ui/
+    ..\FrameXML\UI.xsd">
+
+    <!-- Proc Icon Template -->
+    <Frame name="ShreddedCooldownTemplate" virtual="true" parent="UIParent" movable="true" toplevel="true" alpha="1" enableMouse="true">
+        <Size>
+            <AbsDimension x="40" y="40" />
+        </Size>
+        <Anchors>
+            <Anchor point="TOPLEFT"/>
+        </Anchors>
+        <Layers>
+            <Layer level="BACKGROUND">
+                <Texture name="$parentTexture" setAllPoints="true"/>
+            </Layer>
+            <Layer level="OVERLAY">
+                <FontString name="$parentText" inherits="GameFontNormalLarge" justifyH="CENTER" justifyV="MIDDLE">
+                    <Anchors>
+                        <Anchor point="CENTER"/>
+                    </Anchors>
+                </FontString>
+            </Layer>
+        </Layers>
+        <Scripts>
+            <OnLoad>
+                self:RegisterForDrag("LeftButton")
+            </OnLoad>
+            <OnDragStart>
+                if self:GetName() == "ShreddedCooldown1" then
+                    self:StartMoving()
+                end
+            </OnDragStart>
+            <OnDragStop>
+                self:StopMovingOrSizing()
+            </OnDragStop>
+        </Scripts>
+    </Frame>
+
+    <!-- Status Bar Template -->
+    <StatusBar name="ShreddedStatusBarTemplate" virtual="true">
+        <Size>
+            <AbsDimension x="132" y="18" />
+        </Size>
+        <Layers>
+            <Layer level="BACKGROUND">
+                <Texture name="$parent_Background" setAllPoints="true">
+                    <Color r="0" g="0" b="0" a="0.4" /> 
+                </Texture>
+            </Layer>
+            <Layer level="OVERLAY">
+                <FontString name="$parentText" justifyH="LEFT" inherits="GameFontNormalSmall">
+                    <Anchors>
+                        <Anchor point="LEFT">
+                            <Offset x="4" y="0"/>
+                        </Anchor>
+                    </Anchors>
+                </FontString>
+                <FontString name="$parentSecs" justifyH="RIGHT" inherits="GameFontNormalSmall">
+                    <Anchors>
+                        <Anchor point="RIGHT">
+                            <Offset x="-4" y="0"/>
+                        </Anchor>
+                    </Anchors>
+                </FontString>
+            </Layer>
+        </Layers>
+        <BarTexture file="Interface\TargetingFrame\UI-StatusBar"/>
+        <BarColor r="0" g="1" b="0" a="0.9" />
+    </StatusBar>
+
+    <!-- Bar Template -->
+    <Frame name="ShreddedBarTemplate" virtual="true" parent="UIParent" movable="true" toplevel="true" alpha="1" enableMouse="true">
+        <Size>
+            <AbsDimension x="150" y="18" />
+        </Size>
+        <Frames>
+            <Frame name="$parentIcon">
+                <Size>
+                    <AbsDimension x="18" y="18" />
+                </Size>
+                <Anchors>
+                    <Anchor point="LEFT" relativeTo="$parent" relativePoint="LEFT"/>
+                </Anchors>
+                <Layers>
+                    <Layer level="BACKGROUND">
+                        <Texture name="$parentTexture" setAllPoints="true"/>
+                    </Layer>
+                </Layers>
+            </Frame>
+            <StatusBar name="$parentBar" inherits="ShreddedStatusBarTemplate">
+                <Size>
+                    <AbsDimension x="130" y="18" />
+                </Size>
+                <Anchors>
+                    <Anchor point="RIGHT" relativeTo="$parent" relativePoint="RIGHT"/>
+                </Anchors>
+            </StatusBar>
+        </Frames>
+        <Scripts>
+            <OnLoad>
+                self:RegisterForDrag("LeftButton")
+            </OnLoad>
+            <OnDragStart>
+                if self:GetName() == "ShreddedBar1" then
+                    self:StartMoving()
+                end
+            </OnDragStart>
+            <OnDragStop>
+                self:StopMovingOrSizing()
+            </OnDragStop>
+        </Scripts>
+    </Frame>
+
+    <!-- Move Frame Template -->
+    <Frame name="ShreddedMoveTemplate" virtual="true" parent="UIParent" movable="true" toplevel="true" alpha="0.7" enableMouse="true">
+        <Size>
+            <AbsDimension x="160" y="160" />
+        </Size>
+        <Anchors>
+            <Anchor point="TOPLEFT"/>
+        </Anchors>
+        <Layers>
+            <Layer level="BACKGROUND">
+                <Texture name="$parent_Background" setAllPoints="true">
+                    <Color r="0" g="0.3" b="0.6" a="0.7" /> 
+                </Texture>
+            </Layer>
+            <Layer level="OVERLAY">
+                <FontString name="$parentText" inherits="GameFontNormal" text="">
+                    <Anchors>
+                        <Anchor point="CENTER"/>
+                    </Anchors>
+                </FontString>
+            </Layer>
+        </Layers>
+        <Scripts>
+            <OnLoad>
+                self:RegisterForDrag("LeftButton")
+            </OnLoad>
+            <OnDragStart>
+                self:StartMoving()
+            </OnDragStart>
+            <OnDragStop>
+                self:StopMovingOrSizing()
+            </OnDragStop>
+        </Scripts>
+    </Frame>
+
+</Ui>

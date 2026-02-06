@@ -1,0 +1,24 @@
+## Interface: 120000
+## Title: Shredded
+## Category: Combat
+## Category-deDE: Kampf
+## Category-esES: Combate
+## Category-esMX: Combate
+## Category-frFR: Combat
+## Category-itIT: Combattimento
+## Category-koKR: 전투
+## Category-ptBR: Combate
+## Category-ruRU: Бой
+## Category-zhCN: 战斗
+## Category-zhTW: 戰鬥
+## Notes: Feral Druid combat tracker - tracks DoTs, procs, timer bars, energy and combo points
+## Version: 1.0.0
+## Author: Wittyphantom333
+## SavedVariables: ShreddedSettings
+## AllowAddOnTableAccess: 1
+## IconTexture: Interface\Icons\Ability_Druid_CatForm
+## AddonCompartmentFunc: Shredded_OnAddonCompartmentClick
+
+ShreddedOptions.lua
+Shredded.xml
+Shredded.lua
