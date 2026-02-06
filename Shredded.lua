@@ -77,7 +77,7 @@ function ShreddedO(text)
     DEFAULT_CHAT_FRAME:AddMessage("|cFF00FF00Shredded:|r " .. tostring(text))
 end
 
--- Verbose debug mode (toggle with /Shredded verbose)
+-- Verbose debug mode (toggle with /shredded verbose)
 Shredded_VerboseDebug = false
 local lastVerboseTime = 0
 
@@ -180,8 +180,6 @@ local SPELL_DATABASE = {
       source = SOURCE_TYPES.SPEC_TALENT, tooltip = "Tier 6 - Major cooldown, reduced costs" },
     { key = "WILD_SLASHES", id = 390864, type = "buff",
       source = SOURCE_TYPES.SPEC_TALENT, tooltip = "Tier 7 - Enhanced Swipe/Thrash" },
-    { key = "BERSERK_HEART", id = 391174, talentId = 391174, type = "buff",
-      source = SOURCE_TYPES.SPEC_TALENT, tooltip = "Tier 7 - Berserk: Heart of the Lion" },
     { key = "SOUL_OF_THE_FOREST", id = 114107, type = "buff",
       source = SOURCE_TYPES.SPEC_TALENT, tooltip = "Tier 7 - Finisher energy refund" },
     { key = "CARNIVOROUS_INSTINCT", id = 390902, type = "buff", isPassive = true,
@@ -832,18 +830,48 @@ secretDecoderCooldown:SetHideCountdownNumbers(true)
 
 -- Function to decode a secret duration object into milliseconds
 -- Returns: durationMs (number) or nil if decoding fails
+-- Function to decode a secret duration object into timing info
+-- Returns: remainingMs, durationMs (both in milliseconds) or nil if decoding fails
+-- GetCooldownTimes() returns startTime and duration
+-- For aura durations via SetCooldownFromDurationObject, values are in MILLISECONDS
+-- Returns: remainingSec, durationSec (both in seconds) or nil if decoding fails
 local function DecodeDurationObject(durationObj)
-    if not durationObj then return nil end
+    if not durationObj then return nil, nil end
     local ok = pcall(function()
         secretDecoderCooldown:SetCooldownFromDurationObject(durationObj)
     end)
-    if not ok then return nil end
-    local _, durationMs = secretDecoderCooldown:GetCooldownTimes()
+    if not ok then return nil, nil end
+    
+    local startTimeMs, durationMs = secretDecoderCooldown:GetCooldownTimes()
+    
+    -- GetCooldownTimes returns milliseconds for aura durations
     if durationMs and durationMs > 0 then
-        return durationMs
+        local nowMs = GetTime() * 1000
+        local expirationMs = startTimeMs + durationMs
+        local remainingMs = expirationMs - nowMs
+        
+        if remainingMs > 0 then
+            return remainingMs / 1000, durationMs / 1000
+        end
     end
-    return nil
+    return nil, nil
 end
+
+-- Glow-to-Proc mapping: When these abilities get a glow, it means the corresponding proc is active
+-- Key = ability spellId that gets the glow, Value = proc spellKey
+local GLOW_TO_PROC = {
+    [5221]   = "CLEARCASTING",      -- Shred glows when Clearcasting procs
+    [1822]   = "CLEARCASTING",      -- Rake can also glow for Clearcasting
+    [106785] = "CLEARCASTING",      -- Swipe glows for Clearcasting
+    [106830] = "CLEARCASTING",      -- Thrash glows for Clearcasting
+    [8936]   = "PREDATORY_SWIFTNESS", -- Regrowth glows when Predatory Swiftness procs
+    [22568]  = "APEX_PREDATOR",     -- Ferocious Bite glows when Apex Predator procs
+    [441591] = "RAVAGE",            -- Ravage ability glows when Ravage proc is available
+}
+
+-- Pending procs: When glow appears, mark the proc as "expected" so we can match unassigned instanceIDs
+Shredded_pendingProcs = {}  -- [procKey] = { time = GetTime() }
+local PENDING_PROC_WINDOW = 2  -- Match within 2 seconds of glow appearing
 
 -- Known base durations for auras (pandemic can extend, but these are baselines)
 local BASE_DURATIONS = {
@@ -1563,19 +1591,18 @@ local function FindPlayerAura(spellKey)
     local cachedInstId = Shredded_auraInstanceCache[spellKey]
     if cachedInstId then
         local stillActive = false
-        local durationMs = nil
+        local remainingSec, totalDurationSec = nil, nil
         pcall(function()
             local durationObj = C_UnitAuras.GetAuraDuration("player", cachedInstId)
             if durationObj then
                 stillActive = true
-                -- Use the decoder to extract milliseconds from secret duration object
-                durationMs = DecodeDurationObject(durationObj)
+                -- Use the decoder to extract remaining time from secret duration object (returns seconds)
+                remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
             end
         end)
         
         if stillActive then
-            local remainingSec = durationMs and (durationMs / 1000) or nil
-            local duration = Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
+            local duration = totalDurationSec or Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
             local expTime = remainingSec and (now + remainingSec) or (now + duration)
             auraRawData[spellKey] = {
                 duration = duration,
@@ -1641,11 +1668,11 @@ local function FindPlayerAura(spellKey)
             pcall(function()
                 local durationObj = C_UnitAuras.GetAuraDuration("player", auraData.auraInstanceID)
                 if durationObj then
-                    -- Use widget decoder to extract milliseconds from secret duration
-                    local durationMs = DecodeDurationObject(durationObj)
-                    if durationMs and durationMs > 0 then
-                        duration = Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
-                        expirationTime = now + (durationMs / 1000)
+                    -- Use widget decoder to extract remaining time (returns seconds)
+                    local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                    if remainingSec and remainingSec > 0 then
+                        duration = totalDurationSec or Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
+                        expirationTime = now + remainingSec
                         gotTiming = true
                     end
                 end
@@ -2043,7 +2070,7 @@ local function InitializeAddon()
     Shredded_LoadFrames()
     Shredded_Refresh()
     Shredded_SetupOptions()
-    ShreddedO("Shredded 3.0 loaded! /Shredded move, /Shredded debug, /Shredded reset")
+    ShreddedO("Shredded 1.0 loaded! /shredded move, /shredded debug, /shredded reset")
     
     -- Mark addon as fully initialized
     addonInitialized = true
@@ -2626,16 +2653,16 @@ function StartEventHandler()
                                         Shredded_auraInstanceCache[spellKey] = instId
                                         ShreddedV("Aura ADDED: " .. spellKey .. " (ID:" .. spellId .. ", inst:" .. instId .. ")")
                                         
-                                        -- Get duration using widget decoder
+                                        -- Get duration using widget decoder (returns seconds)
                                         pcall(function()
                                             local durationObj = C_UnitAuras.GetAuraDuration("player", instId)
                                             if durationObj then
-                                                local durationMs = DecodeDurationObject(durationObj)
-                                                local duration = Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
-                                                local remainingSec = durationMs and (durationMs / 1000) or duration
+                                                local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                                                local duration = totalDurationSec or Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
+                                                local remaining = remainingSec or duration
                                                 auraRawData[spellKey] = {
                                                     duration = duration,
-                                                    expirationTime = GetTime() + remainingSec,
+                                                    expirationTime = GetTime() + remaining,
                                                     exists = true,
                                                     source = "UNIT_AURA_event"
                                                 }
@@ -2652,38 +2679,36 @@ function StartEventHandler()
                     end
                     
                     -- Try to match unmatched instanceIDs to our tracked procs
-                    -- Using the cooldown widget decoder (like CooldownCompanion)
+                    -- PRIORITY 1: Match to procs that are "pending" from glow hints
+                    -- PRIORITY 2: Match by duration similarity
                     if #unmatchedInstIds > 0 then
                         local now = GetTime()
                         local consumed = {}  -- Track which instanceIDs we've assigned
                         
-                        -- For each proc we track, try to find a matching unassigned aura
-                        for _, procKey in ipairs(ShreddedCooldownSpells) do
-                            if not Shredded_auraInstanceCache[procKey] then
+                        -- FIRST: Try to match pending procs (from glow hints)
+                        for procKey, pendingInfo in pairs(Shredded_pendingProcs) do
+                            if not Shredded_auraInstanceCache[procKey] and (now - pendingInfo.time) < PENDING_PROC_WINDOW then
                                 local expectedDur = Shredded_cachedDurations.player[procKey] or BASE_DURATIONS[procKey]
-                                local expectedMs = expectedDur and (expectedDur * 1000) or nil
-                                
-                                local bestInstId, bestScore = nil, nil
+                                local bestInstId, bestScore, bestRemaining = nil, nil, nil
                                 
                                 for _, instId in ipairs(unmatchedInstIds) do
                                     if not consumed[instId] then
-                                        -- Use widget decoder to extract duration
                                         local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", instId)
                                         if ok and durationObj then
-                                            local durationMs = DecodeDurationObject(durationObj)
-                                            if durationMs and durationMs > 0 then
-                                                if expectedMs and expectedMs > 0 then
-                                                    -- Match by closest to expected duration
-                                                    local dist = math.abs(durationMs - expectedMs)
+                                            local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                                            if totalDurationSec and totalDurationSec > 0 then
+                                                if expectedDur and expectedDur > 0 then
+                                                    local dist = math.abs(totalDurationSec - expectedDur)
                                                     if not bestScore or dist < bestScore then
                                                         bestScore = dist
                                                         bestInstId = instId
+                                                        bestRemaining = remainingSec
                                                     end
                                                 else
-                                                    -- No expected duration - use longest as fallback
-                                                    if not bestScore or durationMs > bestScore then
-                                                        bestScore = durationMs
+                                                    if not bestScore or totalDurationSec > bestScore then
+                                                        bestScore = totalDurationSec
                                                         bestInstId = instId
+                                                        bestRemaining = remainingSec
                                                     end
                                                 end
                                             end
@@ -2691,23 +2716,69 @@ function StartEventHandler()
                                     end
                                 end
                                 
-                                if bestInstId then
-                                    -- Re-decode to get final duration for this match
-                                    local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", bestInstId)
-                                    if ok and durationObj then
-                                        local durationMs = DecodeDurationObject(durationObj)
-                                        local durSec = durationMs and (durationMs / 1000) or (expectedDur or 15)
-                                        
-                                        Shredded_auraInstanceCache[procKey] = bestInstId
-                                        auraRawData[procKey] = {
-                                            duration = durSec,
-                                            expirationTime = now + durSec,
-                                            exists = true,
-                                            source = "widget_decode"
-                                        }
-                                        consumed[bestInstId] = true
-                                        ShreddedV("Aura MATCHED: " .. procKey .. " (inst:" .. bestInstId .. ", dur:" .. string.format("%.1f", durSec) .. "s)")
+                                if bestInstId and bestRemaining then
+                                    local totalDurSec = bestScore or (expectedDur or 15)
+                                    Shredded_auraInstanceCache[procKey] = bestInstId
+                                    auraRawData[procKey] = {
+                                        duration = totalDurSec,
+                                        expirationTime = now + bestRemaining,
+                                        exists = true,
+                                        source = "pending_match"
+                                    }
+                                    consumed[bestInstId] = true
+                                    Shredded_pendingProcs[procKey] = nil  -- Clear pending
+                                    ShreddedV("PENDING MATCHED: " .. procKey .. " (inst:" .. bestInstId .. ")")
+                                end
+                            end
+                        end
+                        
+                        -- SECOND: Try to match remaining procs by duration
+                        for _, procKey in ipairs(ShreddedCooldownSpells) do
+                            if not Shredded_auraInstanceCache[procKey] then
+                                local expectedDur = Shredded_cachedDurations.player[procKey] or BASE_DURATIONS[procKey]
+                                
+                                local bestInstId, bestScore, bestRemaining = nil, nil, nil
+                                
+                                for _, instId in ipairs(unmatchedInstIds) do
+                                    if not consumed[instId] then
+                                        -- Use widget decoder to extract duration (returns seconds)
+                                        local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", instId)
+                                        if ok and durationObj then
+                                            local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                                            if totalDurationSec and totalDurationSec > 0 then
+                                                if expectedDur and expectedDur > 0 then
+                                                    -- Match by closest to expected total duration
+                                                    local dist = math.abs(totalDurationSec - expectedDur)
+                                                    if not bestScore or dist < bestScore then
+                                                        bestScore = dist
+                                                        bestInstId = instId
+                                                        bestRemaining = remainingSec
+                                                    end
+                                                else
+                                                    -- No expected duration - use longest as fallback
+                                                    if not bestScore or totalDurationSec > bestScore then
+                                                        bestScore = totalDurationSec
+                                                        bestInstId = instId
+                                                        bestRemaining = remainingSec
+                                                    end
+                                                end
+                                            end
+                                        end
                                     end
+                                end
+                                
+                                if bestInstId and bestRemaining then
+                                    local totalDurSec = bestScore or (expectedDur or 15)
+                                    
+                                    Shredded_auraInstanceCache[procKey] = bestInstId
+                                    auraRawData[procKey] = {
+                                        duration = totalDurSec,
+                                        expirationTime = now + bestRemaining,
+                                        exists = true,
+                                        source = "widget_decode"
+                                    }
+                                    consumed[bestInstId] = true
+                                    ShreddedV("Aura MATCHED: " .. procKey .. " (inst:" .. bestInstId .. ", rem:" .. string.format("%.1f", bestRemaining) .. "s)")
                                 end
                             end
                         end
@@ -2740,20 +2811,76 @@ function StartEventHandler()
             isDirty = true  -- Mark for update
             
         elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_SHOW" then
-            -- Proc glow appeared - immediately update to show icon and LOG IT
-            local spellId = ...
-            ShreddedV("Proc GLOW_SHOW: " .. tostring(spellId))
-            -- Log the overlay spell ID with name lookup
-            if spellId and type(spellId) == "number" then
-                local spellName = C_Spell.GetSpellName(spellId)
-                LogProc(spellName or ("Unknown_" .. spellId), spellId, true)
+            -- Proc glow appeared - this is our BEST HINT for proc detection!
+            -- The glow appears on the ability you can use (e.g., Shred), not the proc buff
+            local glowSpellId = ...
+            ShreddedV("Proc GLOW_SHOW: " .. tostring(glowSpellId))
+            
+            -- Log for debugging
+            if glowSpellId and type(glowSpellId) == "number" then
+                local spellName = C_Spell.GetSpellName(glowSpellId)
+                LogProc(spellName or ("Unknown_" .. glowSpellId), glowSpellId, true)
+                
+                -- CRITICAL: Mark the corresponding proc as "pending" for aura matching
+                local procKey = GLOW_TO_PROC[glowSpellId]
+                if procKey then
+                    Shredded_pendingProcs[procKey] = { time = now }
+                    ShreddedV("GLOW HINT: Expecting " .. procKey .. " proc!")
+                    
+                    -- Immediately try to find any unmatched recent aura to assign
+                    -- Check if we have any unassigned instanceIDs from recent UNIT_AURA events
+                    if not Shredded_auraInstanceCache[procKey] then
+                        -- Scan current buffs to find the proc (it should have just been applied)
+                        for i = 1, 40 do
+                            local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+                            if not aura then break end
+                            local instId = aura.auraInstanceID
+                            if instId and not Shredded_auraInstanceCache[procKey] then
+                                -- Try to decode duration (returns seconds)
+                                local durationObj = nil
+                                pcall(function()
+                                    durationObj = C_UnitAuras.GetAuraDuration("player", instId)
+                                end)
+                                if durationObj then
+                                    local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                                    local expectedDur = BASE_DURATIONS[procKey] or 15
+                                    -- Check if this matches expected duration (within 50%)
+                                    if totalDurationSec and totalDurationSec > 0 and remainingSec then
+                                        local diff = math.abs(totalDurationSec - expectedDur)
+                                        if diff < expectedDur * 0.5 then
+                                            -- This is likely our proc!
+                                            Shredded_auraInstanceCache[procKey] = instId
+                                            auraRawData[procKey] = {
+                                                duration = totalDurationSec,
+                                                expirationTime = now + remainingSec,
+                                                exists = true,
+                                                source = "glow_hint"
+                                            }
+                                            ShreddedV("GLOW MATCHED: " .. procKey .. " to inst:" .. instId .. " rem:" .. string.format("%.1f", remainingSec))
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
             end
             isDirty = true
             
         elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_HIDE" then
-            -- Proc glow hidden - update to hide icon
-            local spellId = ...
-            ShreddedV("Proc GLOW_HIDE: " .. tostring(spellId))
+            -- Proc glow hidden - the proc was consumed or expired
+            local glowSpellId = ...
+            ShreddedV("Proc GLOW_HIDE: " .. tostring(glowSpellId))
+            
+            -- Clear the pending proc hint
+            if glowSpellId and type(glowSpellId) == "number" then
+                local procKey = GLOW_TO_PROC[glowSpellId]
+                if procKey then
+                    Shredded_pendingProcs[procKey] = nil
+                    -- Don't clear auraRawData here - let the UNIT_AURA removal handle that
+                end
+            end
             isDirty = true
         end
     end)

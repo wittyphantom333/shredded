@@ -33,7 +33,6 @@ local SPELL_DISPLAY_NAMES = {
     MOMENT_OF_CLARITY = "Moment of Clarity",
     BERSERK = "Berserk",
     WILD_SLASHES = "Wild Slashes",
-    BERSERK_HEART = "Berserk: Heart of the Lion",
     SOUL_OF_THE_FOREST = "Soul of the Forest",
     CARNIVOROUS_INSTINCT = "Carnivorous Instinct",
     FRANTIC_MOMENTUM = "Frantic Momentum",
@@ -42,7 +41,7 @@ local SPELL_DISPLAY_NAMES = {
     FRANTIC_FRENZY = "Frantic Frenzy",
     INCARNATION = "Incarnation: Ashamane",
     CONVOKE = "Convoke the Spirits",
-    MOONFIRE_CAT = "Moonfire (Lunar Insp.)",
+    MOONFIRE_CAT = "Moonfire",
     BLOODTALONS = "Bloodtalons",
     CIRCLE_OF_LIFE = "Circle of Life and Death",
     -- Hero: Druid of the Claw
@@ -477,6 +476,10 @@ local function SetupSlashCommands()
             if rawData then
                 table.insert(lines, "  source: " .. tostring(rawData.source or "?"))
                 table.insert(lines, "  exists: " .. tostring(rawData.exists))
+                if rawData.expirationTime then
+                    local remaining = rawData.expirationTime - GetTime()
+                    table.insert(lines, "  remaining: " .. string.format("%.1f", remaining) .. "s")
+                end
             end
             local isAuraActive = (rawData ~= nil)
             table.insert(lines, "isAuraActive: " .. tostring(isAuraActive))
@@ -484,6 +487,15 @@ local function SetupSlashCommands()
             -- Check auraInstanceCache
             local cachedInstance = Shredded_auraInstanceCache and Shredded_auraInstanceCache[spell]
             table.insert(lines, "auraInstanceCache: " .. (cachedInstance and tostring(cachedInstance) or "NIL"))
+            
+            -- Check pending procs
+            local pendingInfo = Shredded_pendingProcs and Shredded_pendingProcs[spell]
+            if pendingInfo then
+                local age = GetTime() - pendingInfo.time
+                table.insert(lines, "pendingProc: YES (age: " .. string.format("%.1f", age) .. "s)")
+            else
+                table.insert(lines, "pendingProc: NO")
+            end
             
             table.insert(lines, "")
             
@@ -567,11 +579,14 @@ local function SetupSlashCommands()
                             pcall(function()
                                 decoder:SetCooldownFromDurationObject(durationObj)
                             end)
-                            local _, durationMs = decoder:GetCooldownTimes()
+                            local startTimeMs, durationMs = decoder:GetCooldownTimes()
                             if durationMs and durationMs > 0 then
-                                decoderResult = string.format("%.2f sec", durationMs / 1000)
+                                -- Values are in milliseconds
+                                local nowMs = GetTime() * 1000
+                                local remainingMs = (startTimeMs + durationMs) - nowMs
+                                decoderResult = string.format("remaining: %.2f sec, total: %.2f sec", remainingMs / 1000, durationMs / 1000)
                             else
-                                decoderResult = "0 ms returned"
+                                decoderResult = "0 returned"
                             end
                         else
                             decoderResult = "decoder widget not found"
@@ -976,11 +991,11 @@ local function SetupSlashCommands()
             Shredded_OpenOptions()
         end
     end
-    _G.SLASH_Shredded1 = "/Shredded"
-    _G.SLASH_Shredded2 = "/Shredded"
+    _G.SLASH_Shredded1 = "/shredded"
+    _G.SLASH_Shredded2 = "/shredded"
     
     -- Quick debug shortcut
-    _G.SLASH_ShreddedD1 = "/Shreddedd"
+    _G.SLASH_ShreddedD1 = "/shreddedd"
     SlashCmdList["ShreddedD"] = function(msg)
         SlashCmdList["Shredded"]("debug")
     end
@@ -1012,7 +1027,7 @@ local function CreateOptionsPanel()
     desc:SetPoint("TOPLEFT", version, "BOTTOMLEFT", 0, -16)
     desc:SetWidth(550)
     desc:SetJustifyH("LEFT")
-    desc:SetText("Shredded tracks your Feral Druid DoTs, procs, buffs, energy and combo points.\n\nUse /Shredded move to reposition the Timer Bars and Proc Icons.\nUse /Shredded reset to restore default settings.")
+    desc:SetText("Shredded tracks your Feral Druid DoTs, procs, buffs, energy and combo points.\n\nUse /shredded move to reposition the Timer Bars and Proc Icons.\nUse /shredded reset to restore default settings.")
     
     -- Move Frames Button
     local moveBtn = CreateFrame("Button", "ShreddedOptionsMove", optionsPanel, "UIPanelButtonTemplate")
@@ -2062,7 +2077,7 @@ function Shredded_SetupOptions()
         --print("|cFF00FF00Shredded:|r Options registered with Settings API successfully!")
     else
         -- Fallback: just use slash commands
-        --print("|cFFFF0000Shredded:|r Settings API not available - use /Shredded move and /Shredded reset")
+        --print("|cFFFF0000Shredded:|r Settings API not available - use /shredded move and /shredded reset")
     end
     
     -- Schedule a delayed refresh to ensure all data is ready
@@ -2099,11 +2114,11 @@ function Shredded_OpenOptions()
             Settings.OpenToCategory(optionsCategory:GetID())
         end)
         if not success then
-            ShreddedO("Could not open settings panel. Use /Shredded move to move frames, /Shredded reset to reset settings")
+            ShreddedO("Could not open settings panel. Use /shredded move to move frames, /shredded reset to reset settings")
         end
     else
         -- Fallback message
-        ShreddedO("Use /Shredded move to move frames, /Shredded reset to reset settings")
+        ShreddedO("Use /shredded move to move frames, /shredded reset to reset settings")
     end
 end
 
