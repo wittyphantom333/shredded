@@ -283,6 +283,16 @@ local function SetupSlashCommands()
                 ShreddedO("Failed spells: " .. table.concat(failed, ", "))
             end
             
+        elseif msg == "combatlog" then
+            -- Toggle real-time combat logging to chat
+            Shredded_CombatLogEnabled = not Shredded_CombatLogEnabled
+            wipe(Shredded_LastProcState)  -- Reset state tracking
+            if Shredded_CombatLogEnabled then
+                ShreddedO("|cFF00FF00Combat log ENABLED|r - proc state changes will print to chat during combat")
+            else
+                ShreddedO("|cFFFF0000Combat log DISABLED|r")
+            end
+            
         elseif msg == "procs" then
             -- Debug proc detection - shows frame map status and detection
             local lines = {"=== Proc Icons Debug ===", ""}
@@ -303,7 +313,8 @@ local function SetupSlashCommands()
                     local frame = ShreddedCooldownList and ShreddedCooldownList[frameName]
                     local alpha = frame and frame:GetAlpha() or "?"
                     local shown = frame and frame:IsShown() and "Y" or "N"
-                    table.insert(lines, "  " .. spell .. " -> Frame " .. frameNum .. " (alpha=" .. tostring(alpha) .. ", shown=" .. shown .. ")")
+                    local iconId = Shredded_SPELL_ICONS and Shredded_SPELL_ICONS[spell] or "nil"
+                    table.insert(lines, "  " .. spell .. " -> Frame " .. frameNum .. " (icon:" .. tostring(iconId) .. ", alpha=" .. tostring(alpha) .. ")")
                 end
             end
             if mapCount == 0 then
@@ -329,16 +340,29 @@ local function SetupSlashCommands()
                     local hasAura = Shredded_auraRawData and Shredded_auraRawData[key] ~= nil
                     local inMap = Shredded_CooldownFrameMap and Shredded_CooldownFrameMap[key] ~= nil
                     local hasSpell = Shredded_PlayerHasSpell and Shredded_PlayerHasSpell(key)
+                    local hasIcon = Shredded_SPELL_ICONS and Shredded_SPELL_ICONS[key] ~= nil
+                    local iconId = Shredded_SPELL_ICONS and Shredded_SPELL_ICONS[key] or "nil"
+                    
+                    -- Check talentId specifically
+                    local talentId = meta.talentId
+                    local talentCheck = "N/A"
+                    if talentId and type(talentId) == "number" then
+                        local ips = IsPlayerSpell(talentId) and "Y" or "N"
+                        local isk = IsSpellKnown(talentId) and "Y" or "N"
+                        talentCheck = "IPS=" .. ips .. ",ISK=" .. isk
+                    end
                     
                     local status = ""
                     if overlayed then status = status .. " [OVERLAY]" end
                     if hasAura then status = status .. " [AURA]" end
                     if not inMap then status = status .. " [NOT MAPPED]" end
                     if not hasSpell then status = status .. " [NO SPELL]" end
-                    if status == "" then status = " (ready, waiting for proc)" end
+                    if not hasIcon then status = status .. " [NO ICON]" else status = status .. " [icon:" .. tostring(iconId) .. "]" end
+                    if status == "" then status = " (ready, waiting)" end
                     
                     local typeStr = isProc and "proc" or "cd"
-                    table.insert(lines, "  " .. key .. " (" .. typeStr .. ", ID:" .. spellId .. ")" .. status)
+                    local talentStr = talentId and (" tal:" .. talentId .. " " .. talentCheck) or ""
+                    table.insert(lines, "  " .. key .. " (" .. typeStr .. ", ID:" .. spellId .. talentStr .. ")" .. status)
                 else
                     local reason = "no meta"
                     if meta and not spellId then reason = "no ID" end
@@ -346,6 +370,200 @@ local function SetupSlashCommands()
                     table.insert(lines, "  " .. key .. " [SKIP: " .. reason .. "]")
                 end
             end
+            
+            Shredded_ShowDebugPopup(table.concat(lines, "\n"))
+            
+        elseif msg == "framemap" then
+            -- Debug frame mapping - show exactly which spell is on which frame
+            local lines = {"=== Frame Map Debug ===", ""}
+            
+            table.insert(lines, "Shredded_CooldownFrameMap (spell -> frame):")
+            if Shredded_CooldownFrameMap then
+                local sorted = {}
+                for spell, frameNum in pairs(Shredded_CooldownFrameMap) do
+                    table.insert(sorted, {spell = spell, frame = frameNum})
+                end
+                table.sort(sorted, function(a, b) return a.frame < b.frame end)
+                for _, entry in ipairs(sorted) do
+                    local iconId = SPELL_ICONS and SPELL_ICONS[entry.spell] or "nil"
+                    table.insert(lines, "  Frame " .. entry.frame .. " = " .. entry.spell .. " (icon:" .. tostring(iconId) .. ")")
+                end
+            end
+            
+            table.insert(lines, "")
+            table.insert(lines, "Shredded_FrameSpellMap (frame -> spell):")
+            if Shredded_FrameSpellMap then
+                for i = 1, 20 do
+                    local spell = Shredded_FrameSpellMap[i]
+                    if spell then
+                        local iconId = SPELL_ICONS and SPELL_ICONS[spell] or "nil"
+                        table.insert(lines, "  Frame " .. i .. " = " .. spell .. " (icon:" .. tostring(iconId) .. ")")
+                    end
+                end
+            end
+            
+            table.insert(lines, "")
+            table.insert(lines, "Actual Frame Textures:")
+            for i = 1, 20 do
+                local frameName = "ShreddedCooldown" .. i
+                local textureFrame = ShreddedCooldownTextureList and ShreddedCooldownTextureList[frameName]
+                if textureFrame then
+                    local texturePath = textureFrame:GetTexture()
+                    if texturePath then
+                        table.insert(lines, "  Frame " .. i .. " texture: " .. tostring(texturePath))
+                    end
+                end
+            end
+            
+            Shredded_ShowDebugPopup(table.concat(lines, "\n"))
+            
+        elseif msg == "talentcheck" then
+            -- Debug what procs Shredded thinks the player has
+            local lines = {"=== Talent/Proc Detection Debug ===", ""}
+            
+            -- Show detected hero tree (use global function)
+            local heroTree = "unknown"
+            if Shredded_DetectHeroTree then
+                heroTree = Shredded_DetectHeroTree() or "nil (can't detect)"
+            end
+            table.insert(lines, "Detected Hero Tree: " .. heroTree)
+            table.insert(lines, "")
+            
+            -- Check each proc spell
+            table.insert(lines, "Proc Spells (from ShreddedCooldownSpells):")
+            for _, spell in ipairs(ShreddedCooldownSpells) do
+                local meta = Shredded_SpellMeta and Shredded_SpellMeta[spell]
+                if meta and meta.isProc then
+                    local hasSpell = Shredded_PlayerHasSpell and Shredded_PlayerHasSpell(spell)
+                    local isEnabled = ShreddedSettings and ShreddedSettings["cooldownon"] and ShreddedSettings["cooldownon"][spell] ~= false
+                    local source = meta.source or "?"
+                    local frameNum = Shredded_CooldownFrameMap and Shredded_CooldownFrameMap[spell] or "none"
+                    -- Use global Shredded_SPELL_ICONS
+                    local iconId = Shredded_SPELL_ICONS and Shredded_SPELL_ICONS[spell]
+                    local hasIcon = iconId and "Y" or "N"
+                    
+                    local status = ""
+                    if hasSpell then status = status .. "[HAS] " else status = status .. "[NO] " end
+                    if isEnabled then status = status .. "[ON] " else status = status .. "[OFF] " end
+                    status = status .. "frame=" .. tostring(frameNum) .. " icon=" .. hasIcon
+                    if iconId then status = status .. " (" .. tostring(iconId) .. ")" end
+                    
+                    table.insert(lines, "  " .. spell .. " (" .. source .. "): " .. status)
+                end
+            end
+            
+            Shredded_ShowDebugPopup(table.concat(lines, "\n"))
+            
+        elseif msg == "detect" then
+            -- Real-time detection debug - what's being detected RIGHT NOW
+            local inCombat = InCombatLockdown()
+            local lines = {"=== Real-Time Proc Detection ===", "Combat: " .. tostring(inCombat), ""}
+            
+            for _, spell in ipairs(ShreddedCooldownSpells) do
+                local spellMeta = Shredded_SpellMeta and Shredded_SpellMeta[spell]
+                local spellId = spellMeta and spellMeta.id
+                local frameNum = Shredded_CooldownFrameMap and Shredded_CooldownFrameMap[spell]
+                
+                if spellId and spellMeta and spellMeta.isProc then
+                    -- Check event-captured instance cache FIRST (like CooldownCompanion)
+                    local cachedInstId = Shredded_auraInstanceCache and Shredded_auraInstanceCache[spell]
+                    
+                    -- Check GetPlayerAuraBySpellID for main ID
+                    local auraData = nil
+                    local auraOk, auraResult = pcall(C_UnitAuras.GetPlayerAuraBySpellID, spellId)
+                    if auraOk then auraData = auraResult end
+                    
+                    local auraInstanceID = nil
+                    if auraData then
+                        pcall(function() auraInstanceID = auraData.auraInstanceID end)
+                    end
+                    
+                    -- Also check altIds
+                    local altIdFound = nil
+                    if not auraInstanceID and spellMeta.altIds then
+                        for _, altId in ipairs(spellMeta.altIds) do
+                            local altOk, altData = pcall(C_UnitAuras.GetPlayerAuraBySpellID, altId)
+                            if altOk and altData then
+                                pcall(function()
+                                    if altData.auraInstanceID then
+                                        auraInstanceID = altData.auraInstanceID
+                                        altIdFound = altId
+                                    end
+                                end)
+                            end
+                            if auraInstanceID then break end
+                        end
+                    end
+                    
+                    -- Check IsSpellOverlayed
+                    local overlayed = false
+                    pcall(function()
+                        overlayed = C_SpellActivationOverlay.IsSpellOverlayed(spellId)
+                    end)
+                    -- Also check altIds for overlay
+                    if not overlayed and spellMeta.altIds then
+                        for _, altId in ipairs(spellMeta.altIds) do
+                            pcall(function()
+                                overlayed = C_SpellActivationOverlay.IsSpellOverlayed(altId)
+                            end)
+                            if overlayed then break end
+                        end
+                    end
+                    
+                    local status = ""
+                    if cachedInstId then
+                        status = status .. "[CACHE:" .. cachedInstId .. "] "
+                    end
+                    if auraInstanceID then 
+                        status = status .. "[API:" .. auraInstanceID
+                        if altIdFound then status = status .. " via altId " .. altIdFound end
+                        status = status .. "] "
+                    end
+                    if overlayed then status = status .. "[OVERLAY] " end
+                    if status == "" then status = "(not detected)" end
+                    
+                    local frameStr = frameNum and ("Frame " .. frameNum) or "NOT MAPPED"
+                    table.insert(lines, spell .. " (ID:" .. spellId .. ") " .. frameStr .. " - " .. status)
+                end
+            end
+            
+            Shredded_ShowDebugPopup(table.concat(lines, "\n"))
+            
+        elseif msg == "buffscan" then
+            -- Scan ALL current player buffs and show their ACTUAL spell IDs
+            -- This is critical to find correct buff IDs for procs
+            local lines = {"=== ACTUAL Player Buffs Right Now ===", "Run this when a proc is active!", ""}
+            
+            for i = 1, 40 do
+                local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+                if not aura then break end
+                
+                local name, spellId, icon, duration, expTime, instId = "?", "?", "?", "?", "?", "?"
+                pcall(function() name = aura.name end)
+                pcall(function() spellId = aura.spellId end)
+                pcall(function() icon = aura.icon end)
+                pcall(function() duration = aura.duration end)
+                pcall(function() expTime = aura.expirationTime end)
+                pcall(function() instId = aura.auraInstanceID end)
+                
+                -- Check if this ID is in our database
+                local knownAs = Shredded_SPELL_ID_TO_KEY and Shredded_SPELL_ID_TO_KEY[spellId] or nil
+                local knownStr = knownAs and (" -> " .. knownAs) or ""
+                
+                -- Check overlay
+                local hasOverlay = false
+                if type(spellId) == "number" then
+                    pcall(function() hasOverlay = C_SpellActivationOverlay.IsSpellOverlayed(spellId) end)
+                end
+                local overlayStr = hasOverlay and " [GLOW]" or ""
+                
+                local line = string.format("%d. %s (ID:%s) dur=%s%s%s", i, tostring(name), tostring(spellId), tostring(duration), knownStr, overlayStr)
+                table.insert(lines, line)
+            end
+            
+            table.insert(lines, "")
+            table.insert(lines, "IDs with -> show what Shredded thinks they are.")
+            table.insert(lines, "IDs without -> are NOT in our database!")
             
             Shredded_ShowDebugPopup(table.concat(lines, "\n"))
             
@@ -1416,6 +1634,28 @@ local function CreateCooldownVisualsPanel()
     end)
     opacitySlider:SetScript("OnShow", function(self)
         self:SetValue(ShreddedSettings["cooldownalpha"] or 0.85)
+    end)
+    
+    -- Rest Opacity Slider (show icons when not active)
+    local restOpacityLabel = cooldownVisualsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    restOpacityLabel:SetPoint("TOPLEFT", opacitySlider, "BOTTOMLEFT", 0, -30)
+    restOpacityLabel:SetText("Rest Opacity (0 = hidden when inactive)")
+    
+    local restOpacitySlider = CreateFrame("Slider", "ShreddedOptionsCooldownRestOpacity", cooldownVisualsPanel, "OptionsSliderTemplate")
+    restOpacitySlider:SetPoint("TOPLEFT", restOpacityLabel, "BOTTOMLEFT", 0, -10)
+    restOpacitySlider:SetMinMaxValues(0, 1)
+    restOpacitySlider:SetValueStep(0.05)
+    restOpacitySlider:SetObeyStepOnDrag(true)
+    restOpacitySlider:SetWidth(200)
+    restOpacitySlider.Low:SetText("0%")
+    restOpacitySlider.High:SetText("100%")
+    restOpacitySlider:SetScript("OnValueChanged", function(self, value)
+        ShreddedSettings["cooldownrestalpha"] = value
+        self.Text:SetText(floor(value * 100) .. "%")
+        Shredded_Refresh()
+    end)
+    restOpacitySlider:SetScript("OnShow", function(self)
+        self:SetValue(ShreddedSettings["cooldownrestalpha"] or 0)
     end)
     
     -- OnShow
