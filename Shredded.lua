@@ -164,7 +164,7 @@ local SPELL_DATABASE = {
     -- ===== FERAL SPEC ABILITIES =====
     { key = "PREDATORY_SWIFTNESS", id = 69369, altIds = {69369, 16974}, type = "buff", core = true, isProc = true,
       source = SOURCE_TYPES.SPEC_ABILITY, tooltip = "Feral (level 30) - Free instant heal after finisher" },
-    { key = "CLEARCASTING", id = 135700, talentId = 16864, altIds = {135700, 16870}, type = "buff", isProc = true,
+    { key = "CLEARCASTING", id = 135700, talentId = 16864, altIds = {135700, 16870, 16864}, type = "buff", isProc = true,
       source = SOURCE_TYPES.SPEC_TALENT, tooltip = "Omen of Clarity (Tier 2) - Free ability proc" },
       
     -- ===== FERAL SPEC TALENTS =====
@@ -206,17 +206,17 @@ local SPELL_DATABASE = {
       source = SOURCE_TYPES.SPEC_TALENT, tooltip = "Tier 10 - DoT duration changes (passive)" },
       
     -- ===== HERO TALENTS: Druid of the Claw =====
-    { key = "RAVAGE", id = 441585, altIds = {441585, 441591}, type = "buff", isProc = true,
+    { key = "RAVAGE", id = 441585, altIds = {441585, 441591, 441583}, type = "buff", isProc = true,
       source = SOURCE_TYPES.HERO_CLAW, tooltip = "Row 1 - Empowered Shred ability (proc)" },
     { key = "DREADFUL_WOUND", id = 451177, altIds = {451177, 391356, 441583, 441590}, displayName = "Dreadful Wound", type = "debuff", core = true,
       source = SOURCE_TYPES.HERO_CLAW, tooltip = "Ravage debuff on target" },
-    { key = "INFECTED_WOUNDS", id = 58180, displayName = "Infected Wounds", type = "debuff", core = true,
+    { key = "INFECTED_WOUNDS", id = 58180, altIds = {58180, 48484}, displayName = "Infected Wounds", type = "debuff", core = true,
       source = SOURCE_TYPES.CLASS_TALENT, tooltip = "Healing reduction/slow on target" },
-    { key = "KILLING_STRIKES", id = 441825, displayName = "Killing Strikes", type = "buff", isProc = true,
+    { key = "KILLING_STRIKES", id = 441825, altIds = {441825, 441824}, displayName = "Killing Strikes", type = "buff", isProc = true,
       source = SOURCE_TYPES.HERO_CLAW, tooltip = "Ravage proc - increased crit damage" },
-    { key = "SAVAGE_FURY", id = 449646, displayName = "Savage Fury", type = "buff", isProc = true,
+    { key = "SAVAGE_FURY", id = 449646, altIds = {449646, 449645}, displayName = "Savage Fury", type = "buff", isProc = true,
       source = SOURCE_TYPES.HERO_CLAW, tooltip = "Druid of the Claw - empowered attacks" },
-    { key = "COILED_TO_SPRING", id = 449651, altIds = {449651, 449650}, displayName = "Coiled to Spring", type = "buff", isProc = true,
+    { key = "COILED_TO_SPRING", id = 449651, altIds = {449651, 449650, 449537}, displayName = "Coiled to Spring", type = "buff", isProc = true,
       source = SOURCE_TYPES.HERO_CLAW, tooltip = "Druid of the Claw - next ability empowered" },
     { key = "BESTIAL_STRENGTH", id = 441841, type = "buff", isPassive = true,
       source = SOURCE_TYPES.HERO_CLAW, tooltip = "Row 2 - Damage increase (passive)" },
@@ -881,29 +881,302 @@ local function DecodeDurationObject(durationObj)
     return nil, nil
 end
 
--- Glow-to-Proc mapping: When these abilities get a glow, it means the corresponding proc is active
--- Key = ability spellId that gets the glow, Value = proc spellKey
-local GLOW_TO_PROC = {
-    [5221]   = "CLEARCASTING",      -- Shred glows when Clearcasting procs
-    [1822]   = "CLEARCASTING",      -- Rake can also glow for Clearcasting
-    [106785] = "CLEARCASTING",      -- Swipe glows for Clearcasting
-    [106830] = "CLEARCASTING",      -- Thrash glows for Clearcasting
-    [8936]   = "PREDATORY_SWIFTNESS", -- Regrowth glows when Predatory Swiftness procs
-    [22568]  = "APEX_PREDATOR",     -- Ferocious Bite glows when Apex Predator procs
-    [441591] = "RAVAGE",            -- Ravage ability glows when Ravage proc is available
-    -- Moment of Clarity enhances Shred (same abilities as Clearcasting but separate buff)
-    -- Hero talent procs don't typically cause glows, they're passive buffs
+-- ===========================================
+-- CDM VIEWER-BASED AURA TRACKING
+-- ===========================================
+-- Instead of caching auraInstanceIDs and matching by duration, we read directly
+-- from Blizzard's Cooldown Manager (CDM) viewer frames. These frames run untainted
+-- code that stores auraInstanceID and auraDataUnit as plain readable properties,
+-- even during combat when spell IDs are secret.
+--
+-- This approach comes from CooldownCompanion and eliminates all guesswork:
+-- no duration matching, no glow hints, no pending procs, no cache invalidation.
+
+-- Viewer frame names (Blizzard CDM globals)
+-- Order matters: Essential/Utility first, BuffIcon/BuffBar LAST so they WIN
+-- (BuffIcon/BuffBar have auraInstanceID; Essential/Utility do NOT)
+local VIEWER_NAMES = {
+    "EssentialCooldownViewer",  -- Tracks spell cooldowns - does NOT have auraInstanceID
+    "UtilityCooldownViewer",    -- Tracks spell cooldowns - does NOT have auraInstanceID
+    "BuffIconCooldownViewer",   -- Tracks aura durations (buffs) - HAS auraInstanceID
+    "BuffBarCooldownViewer",    -- Tracks aura durations (buffs/debuffs) - HAS auraInstanceID
 }
 
--- Reverse lookup: which procs have glow mappings (these should ONLY match via glow hints)
-local PROC_HAS_GLOW = {}
-for _, procKey in pairs(GLOW_TO_PROC) do
-    PROC_HAS_GLOW[procKey] = true
+-- Viewer names that support auraInstanceID (for preference checking)
+local BUFF_VIEWER_NAMES = {
+    ["BuffIconCooldownViewer"] = true,
+    ["BuffBarCooldownViewer"] = true,
+}
+
+-- Map: spellID → Blizzard CDM viewer child frame
+Shredded_viewerAuraFrames = {}
+
+-- Helper: check if a viewer child is from a buff viewer (has auraInstanceID support)
+local function IsBuffViewerChild(child)
+    if not child then return false end
+    local parent = child:GetParent()
+    if not parent then return false end
+    local name = parent:GetName()
+    return name and BUFF_VIEWER_NAMES[name] or false
 end
 
--- Pending procs: When glow appears, mark the proc as "expected" so we can match unassigned instanceIDs
-Shredded_pendingProcs = {}  -- [procKey] = { time = GetTime() }
-local PENDING_PROC_WINDOW = 2  -- Match within 2 seconds of glow appearing
+-- Ensure CDM viewer frames are shown (with alpha=0 so they're invisible)
+-- Blizzard only populates cooldownInfo/auraInstanceID on children when the viewer is shown.
+-- CooldownCompanion uses the same technique: SetAlpha(0) instead of Hide().
+local viewersHooked = false
+local function EnsureViewersShown()
+    -- Don't try to Show() protected frames during combat (would cause taint)
+    if InCombatLockdown() then return end
+    
+    for _, name in ipairs(VIEWER_NAMES) do
+        local viewer = _G[name]
+        if viewer then
+            -- Show with alpha=0 (invisible but active)
+            if not viewer:IsShown() then
+                pcall(function()
+                    viewer:SetAlpha(0)
+                    viewer:Show()
+                end)
+                ShreddedV("CDM viewer " .. name .. " was hidden - showing with alpha=0")
+            end
+            
+            -- Hook OnHide to re-show (only hook once)
+            if not viewersHooked then
+                pcall(function()
+                    viewer:HookScript("OnHide", function(self)
+                        -- Re-show with alpha=0 after a tiny delay (avoid re-entrance and combat)
+                        C_Timer.After(0.1, function()
+                            if not InCombatLockdown() and not self:IsShown() then
+                                pcall(function()
+                                    self:SetAlpha(0)
+                                    self:Show()
+                                end)
+                                ShreddedV("CDM viewer re-shown after hide: " .. (self:GetName() or "?"))
+                                -- Rebuild map after viewers get repopulated
+                                C_Timer.After(1, function()
+                                    if BuildViewerAuraMap then BuildViewerAuraMap() end
+                                end)
+                            end
+                        end)
+                    end)
+                end)
+            end
+        end
+    end
+    viewersHooked = true
+end
+
+-- Build mapping from spellID → CDM viewer child frame
+-- Viewer children have .cooldownInfo with spellID, overrideSpellID, overrideTooltipSpellID
+-- BuffIcon/BuffBar children also have .auraInstanceID and .auraDataUnit when an aura is active
+local BuildViewerAuraMap  -- forward declaration
+function Shredded_RebuildViewerMap()
+    if BuildViewerAuraMap then BuildViewerAuraMap() end
+end
+BuildViewerAuraMap = function()
+    -- Ensure viewers are shown (with alpha=0) so Blizzard populates cooldownInfo
+    EnsureViewersShown()
+    
+    wipe(Shredded_viewerAuraFrames)
+    local viewerCounts = {}
+    local childrenWithInfo = 0
+    
+    for _, name in ipairs(VIEWER_NAMES) do
+        local viewer = _G[name]
+        viewerCounts[name] = 0
+        if viewer then
+            local children = {viewer:GetChildren()}
+            viewerCounts[name] = #children
+            for _, child in pairs(children) do
+                if child.cooldownInfo then
+                    childrenWithInfo = childrenWithInfo + 1
+                    local isBuff = BUFF_VIEWER_NAMES[name] or false
+                    local function MapId(id)
+                        if not id then return end
+                        local existing = Shredded_viewerAuraFrames[id]
+                        -- Always map if no existing, or if we're a buff viewer replacing a non-buff viewer
+                        if not existing or isBuff or not IsBuffViewerChild(existing) then
+                            Shredded_viewerAuraFrames[id] = child
+                        end
+                    end
+                    MapId(child.cooldownInfo.spellID)
+                    MapId(child.cooldownInfo.overrideSpellID)
+                    MapId(child.cooldownInfo.overrideTooltipSpellID)
+                end
+            end
+        end
+    end
+    
+    -- API-based fallback: if no viewer children had cooldownInfo, use C_CooldownViewer API
+    -- to build a spellID → viewer child lookup by matching cooldownInfo data to children
+    if childrenWithInfo == 0 then
+        ShreddedV("No viewer children have cooldownInfo - trying C_CooldownViewer API fallback")
+        -- CDM categories: 0=Essential, 1=Utility, 2=TrackedBuff(Icon), 3=TrackedBar
+        local CATEGORY_TO_VIEWER = {
+            [0] = "EssentialCooldownViewer",
+            [1] = "UtilityCooldownViewer",
+            [2] = "BuffIconCooldownViewer",
+            [3] = "BuffBarCooldownViewer",
+        }
+        for cat = 0, 3 do
+            local ok, cdIds = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, cat, true)
+            if ok and cdIds then
+                local viewerName = CATEGORY_TO_VIEWER[cat]
+                local isBuff = BUFF_VIEWER_NAMES[viewerName] or false
+                ShreddedV("  Category " .. cat .. " (" .. viewerName .. "): " .. #cdIds .. " cooldowns")
+                for _, cdID in ipairs(cdIds) do
+                    local ok2, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cdID)
+                    if ok2 and info then
+                        -- Find the viewer child for this cooldown by matching layoutIndex or cooldownID
+                        local viewer = _G[viewerName]
+                        local matchedChild = nil
+                        if viewer then
+                            for _, child in pairs({viewer:GetChildren()}) do
+                                -- Match by cooldownInfo if available, or by being a non-decoration frame
+                                if child.cooldownInfo and child.cooldownInfo.spellID == info.spellID then
+                                    matchedChild = child
+                                    break
+                                end
+                            end
+                        end
+                        -- Even without a matched child frame, store the API info for detection
+                        -- We'll create a synthetic entry with the info we have
+                        if not matchedChild and viewer then
+                            -- Find any active child we can use - try to match by properties
+                            for _, child in pairs({viewer:GetChildren()}) do
+                                if child.Cooldown and child.layoutIndex then
+                                    -- Can't reliably match without cooldownInfo, but store what we can
+                                    matchedChild = child
+                                    break
+                                end
+                            end
+                        end
+                        -- Map spellIDs from API data (even without a matched child, track the info)
+                        local function ApiMapId(id)
+                            if not id then return end
+                            if matchedChild then
+                                local existing = Shredded_viewerAuraFrames[id]
+                                if not existing or isBuff or not IsBuffViewerChild(existing) then
+                                    Shredded_viewerAuraFrames[id] = matchedChild
+                                end
+                            end
+                        end
+                        ApiMapId(info.spellID)
+                        ApiMapId(info.overrideSpellID)
+                        ApiMapId(info.overrideTooltipSpellID)
+                        -- Also map linked spell IDs
+                        if info.linkedSpellIDs then
+                            for _, linkedId in ipairs(info.linkedSpellIDs) do
+                                ApiMapId(linkedId)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Resolve ability → aura spell ID mapping via Blizzard API
+    -- (e.g., ability "Shred" might have a different buff ID for "Clearcasting")
+    for _, spellData in ipairs(SPELL_DATABASE) do
+        local id = spellData.id
+        if id and not Shredded_viewerAuraFrames[id] then
+            -- Try talentId (CDM often tracks by talent ID, not buff ID)
+            if spellData.talentId and Shredded_viewerAuraFrames[spellData.talentId] then
+                Shredded_viewerAuraFrames[id] = Shredded_viewerAuraFrames[spellData.talentId]
+            end
+            -- Try GetCooldownAuraBySpellID (maps ability → buff ID)
+            if not Shredded_viewerAuraFrames[id] then
+                local ok, auraId = pcall(C_UnitAuras.GetCooldownAuraBySpellID, id)
+                if ok and auraId and auraId ~= 0 and auraId ~= id and Shredded_viewerAuraFrames[auraId] then
+                    Shredded_viewerAuraFrames[id] = Shredded_viewerAuraFrames[auraId]
+                end
+            end
+            -- Try GetBaseSpell
+            if not Shredded_viewerAuraFrames[id] then
+                local ok2, baseId = pcall(C_Spell.GetBaseSpell, id)
+                if ok2 and baseId and baseId ~= id and Shredded_viewerAuraFrames[baseId] then
+                    Shredded_viewerAuraFrames[id] = Shredded_viewerAuraFrames[baseId]
+                end
+            end
+        end
+        -- Bidirectional altId mapping:
+        -- 1. If primary has a mapping, propagate to unmapped altIds
+        -- 2. If any altId has a mapping, propagate back to primary and to other altIds
+        if spellData.altIds then
+            -- First pass: find best mapped child (prefer buff viewers)
+            local bestChild = Shredded_viewerAuraFrames[id]
+            if not bestChild then
+                for _, altId in ipairs(spellData.altIds) do
+                    local altChild = Shredded_viewerAuraFrames[altId]
+                    if altChild then
+                        if not bestChild or (IsBuffViewerChild(altChild) and not IsBuffViewerChild(bestChild)) then
+                            bestChild = altChild
+                        end
+                    end
+                end
+            end
+            -- Also try API resolution on altIds
+            if not bestChild then
+                for _, altId in ipairs(spellData.altIds) do
+                    local ok, auraId = pcall(C_UnitAuras.GetCooldownAuraBySpellID, altId)
+                    if ok and auraId and auraId ~= 0 and Shredded_viewerAuraFrames[auraId] then
+                        bestChild = Shredded_viewerAuraFrames[auraId]
+                        break
+                    end
+                end
+            end
+            -- Second pass: propagate bestChild to primary and all altIds
+            if bestChild then
+                if not Shredded_viewerAuraFrames[id] or
+                   (IsBuffViewerChild(bestChild) and not IsBuffViewerChild(Shredded_viewerAuraFrames[id])) then
+                    Shredded_viewerAuraFrames[id] = bestChild
+                end
+                for _, altId in ipairs(spellData.altIds) do
+                    if not Shredded_viewerAuraFrames[altId] then
+                        Shredded_viewerAuraFrames[altId] = bestChild
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Log summary
+    local total = 0
+    local buffCount = 0
+    for id, child in pairs(Shredded_viewerAuraFrames) do
+        total = total + 1
+        if IsBuffViewerChild(child) then buffCount = buffCount + 1 end
+    end
+    ShreddedV("CDM Viewer map built: " .. total .. " IDs mapped (" .. buffCount .. " from buff viewers)")
+    for name, cnt in pairs(viewerCounts) do
+        ShreddedV("  " .. name .. ": " .. cnt .. " children")
+    end
+    
+    -- Log which of OUR tracked spells got mapped
+    local mappedCount = 0
+    for _, spellData in ipairs(SPELL_DATABASE) do
+        local id = spellData.id
+        local child = Shredded_viewerAuraFrames[id]
+        if child then
+            mappedCount = mappedCount + 1
+            local parentName = child:GetParent() and child:GetParent():GetName() or "?"
+            local isBuff = IsBuffViewerChild(child)
+            ShreddedV("  " .. spellData.key .. " (" .. id .. ") -> " .. parentName .. (isBuff and " [BUFF]" or " [CD]"))
+        end
+    end
+    
+    -- Retry logic: if no children had cooldownInfo, CDM may still be loading
+    Shredded_viewerMapRetries = (Shredded_viewerMapRetries or 0)
+    if total == 0 and Shredded_viewerMapRetries < 5 then
+        Shredded_viewerMapRetries = Shredded_viewerMapRetries + 1
+        local delay = Shredded_viewerMapRetries * 2  -- 2s, 4s, 6s, 8s, 10s
+        ShreddedV("CDM map empty - retry #" .. Shredded_viewerMapRetries .. " in " .. delay .. "s")
+        C_Timer.After(delay, BuildViewerAuraMap)
+    elseif total > 0 then
+        Shredded_viewerMapRetries = 0  -- Reset on success
+    end
+end
 
 -- Known base durations for auras (pandemic can extend, but these are baselines)
 local BASE_DURATIONS = {
@@ -1382,7 +1655,7 @@ local function InitTimers()
     durations["INFECTED_WOUNDS"] = 12  -- Healing reduction/slow
     durations["KILLING_STRIKES"] = 6  -- Crit damage proc
     durations["SAVAGE_FURY"] = 6  -- Empowered attacks proc
-    durations["COILED_TO_SPRING"] = 6  -- Next ability empowered
+    durations["COILED_TO_SPRING"] = 15  -- Next ability empowered
     durations["CLAW_RAMPAGE"] = 10
     durations["BESTIAL_STRENGTH"] = 0  -- Passive
     durations["EMPOWERED_SHAPESHIFTING"] = 0  -- Passive
@@ -1637,9 +1910,6 @@ local function FindAuraByName(unit, filter, targetName)
     return nil
 end
 
--- Cache of auraInstanceIDs for combat fallback (like CooldownCompanion)
-Shredded_auraInstanceCache = {}  -- spellKey -> auraInstanceID
-
 local function FindPlayerAura(spellKey)
     local spellId = SPELL_IDS[spellKey]
     
@@ -1654,57 +1924,6 @@ local function FindPlayerAura(spellKey)
     end
     
     local now = GetTime()
-    local inCombat = InCombatLockdown()
-    
-    -- PRIORITY 1: Check cached auraInstanceID first (works in combat!)
-    -- This is the CooldownCompanion approach - use widget to decode secret duration
-    local cachedInstId = Shredded_auraInstanceCache[spellKey]
-    if cachedInstId then
-        local stillActive = false
-        local remainingSec, totalDurationSec = nil, nil
-        pcall(function()
-            local durationObj = C_UnitAuras.GetAuraDuration("player", cachedInstId)
-            if durationObj then
-                stillActive = true
-                -- Use the decoder to extract remaining time from secret duration object (returns seconds)
-                remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-            end
-        end)
-        
-        if stillActive then
-            -- VERIFY: Check that the decoded duration is close to expected for this spell
-            -- This prevents mismatched cache entries from causing wrong aura detection
-            local expectedDur = Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey]
-            local durationMismatch = false
-            if expectedDur and expectedDur > 0 and totalDurationSec and totalDurationSec > 0 then
-                local diff = math.abs(totalDurationSec - expectedDur)
-                if diff > 3 then  -- More than 3 seconds difference = likely wrong aura
-                    durationMismatch = true
-                    ShreddedV("Cache MISMATCH for " .. spellKey .. ": expected " .. expectedDur .. "s, got " .. string.format("%.1f", totalDurationSec) .. "s - clearing cache")
-                    Shredded_auraInstanceCache[spellKey] = nil
-                end
-            end
-            
-            if not durationMismatch then
-                local duration = totalDurationSec or expectedDur or 15
-                local expTime = remainingSec and (now + remainingSec) or (now + duration)
-                auraRawData[spellKey] = {
-                    duration = duration,
-                    expirationTime = expTime,
-                    exists = true,
-                    source = "instanceID_cache"
-                }
-                return { spellId = spellId, auraInstanceID = cachedInstId }
-            end
-        else
-            -- Instance no longer valid
-            Shredded_auraInstanceCache[spellKey] = nil
-        end
-    end
-    
-    -- PRIORITY 2: Try direct API lookup (may work out of combat)
-    local now = GetTime()
-    local inCombat = InCombatLockdown()
     
     -- Build list of IDs to check (primary + alternates)
     local idsToCheck = {spellId}
@@ -1715,93 +1934,124 @@ local function FindPlayerAura(spellKey)
         end
     end
     
-    -- Try each ID until we find the aura
-    local auraData = nil
-    local foundSpellId = nil
+    -- PRIORITY 1: CDM Viewer-based lookup (works in combat with secret values!)
+    -- Blizzard's CDM viewer frames store auraInstanceID as a plain readable property
+    -- KEY: If viewerInstId is non-nil, the aura IS active. Timing extraction is best-effort.
+    -- NOTE: Only BuffIcon/BuffBar viewers support auraInstanceID; Essential/Utility do NOT.
     for _, checkId in ipairs(idsToCheck) do
-        pcall(function()
-            local data = C_UnitAuras.GetPlayerAuraBySpellID(checkId)
-            if data then
-                auraData = data
-                foundSpellId = checkId
+        local viewerFrame = Shredded_viewerAuraFrames[checkId]
+        if viewerFrame then
+            -- Check auraInstanceID (only populated by BuffIcon/BuffBar viewers)
+            local viewerInstId = viewerFrame.auraInstanceID
+            if viewerInstId then
+                local unit = viewerFrame.auraDataUnit or "player"
+                if unit == "player" then
+                    -- Aura IS active (viewerInstId non-nil proves it)
+                    -- Try to get timing (best-effort, not required for detection)
+                    local remainingSec, totalDurationSec = nil, nil
+                    local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, unit, viewerInstId)
+                    if ok and durationObj then
+                        remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                    end
+                    -- If decode failed, try the viewer's Cooldown widget
+                    if not remainingSec and viewerFrame.Cooldown then
+                        local startMs, durMs = viewerFrame.Cooldown:GetCooldownTimes()
+                        pcall(function()
+                            if durMs and durMs > 0 then
+                                local endMs = startMs + durMs
+                                if endMs > now * 1000 then
+                                    remainingSec = (endMs - now * 1000) / 1000
+                                    totalDurationSec = durMs / 1000
+                                end
+                            end
+                        end)
+                    end
+                    -- Populate auraRawData with whatever timing we got
+                    local duration = totalDurationSec or BASE_DURATIONS[spellKey] or 15
+                    local expTime = remainingSec and (now + remainingSec) or (now + duration)
+                    auraRawData[spellKey] = {
+                        duration = duration,
+                        expirationTime = expTime,
+                        exists = true,
+                        source = remainingSec and "CDM_viewer" or "CDM_active"
+                    }
+                    return { spellId = checkId, auraInstanceID = viewerInstId }
+                end
             end
-        end)
-        if auraData then break end
+            -- NOTE: Do NOT use Cooldown widget as fallback detection.
+            -- Cooldown:GetCooldownTimes() retains stale data from previously-active
+            -- procs, causing false positives. Only auraInstanceID is reliable.
+        end
     end
     
-    if auraData then
-        -- AURA EXISTS! Now try to get timing info
-        local duration = nil
-        local expirationTime = nil
-        local gotTiming = false
-        
-        -- Method 1: Try direct numeric extraction (works out of combat)
+    -- PRIORITY 2: Direct API lookup (fallback — works out of combat, partial in combat)
+    -- Only check the primary spell ID here, NOT altIds.
+    -- altIds contain talent/ability IDs (e.g. 16864 Omen of Clarity) that return
+    -- passive auras ALWAYS active on the player, causing false positives.
+    do
+        local auraData = nil
         pcall(function()
-            local d = auraData.duration
-            local e = auraData.expirationTime
-            -- Check if we can do math with them (will fail if secret)
-            local test = e - now
-            if test > -1000 and test < 10000 then  -- Sanity check
-                duration = d
-                expirationTime = e
-                gotTiming = true
-            end
+            auraData = C_UnitAuras.GetPlayerAuraBySpellID(spellId)
         end)
-        
-        -- Method 2: Use GetAuraDuration with auraInstanceID + widget decoder (CooldownCompanion approach)
-        if not gotTiming and auraData.auraInstanceID then
+        if auraData then
+            -- Aura exists! Try to get timing (best-effort)
+            local duration = nil
+            local expirationTime = nil
+            local gotTiming = false
+            
+            -- Try direct numeric extraction (works out of combat)
             pcall(function()
-                local durationObj = C_UnitAuras.GetAuraDuration("player", auraData.auraInstanceID)
-                if durationObj then
-                    -- Use widget decoder to extract remaining time (returns seconds)
-                    local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-                    if remainingSec and remainingSec > 0 then
-                        duration = totalDurationSec or Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
-                        expirationTime = now + remainingSec
-                        gotTiming = true
-                    end
+                local d = auraData.duration
+                local e = auraData.expirationTime
+                local test = e - now
+                if test > -1000 and test < 10000 then
+                    duration = d
+                    expirationTime = e
+                    gotTiming = true
                 end
             end)
-            -- Cache the instanceID for future checks
-            Shredded_auraInstanceCache[spellKey] = auraData.auraInstanceID
+            
+            -- Try GetAuraDuration with decoder (auraInstanceID may be secret here)
+            if not gotTiming then
+                local instId = nil
+                pcall(function() instId = auraData.auraInstanceID end)
+                if instId then
+                    pcall(function()
+                        local durationObj = C_UnitAuras.GetAuraDuration("player", instId)
+                        if durationObj then
+                            local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                            if remainingSec and remainingSec > 0 then
+                                duration = totalDurationSec or BASE_DURATIONS[spellKey] or 15
+                                expirationTime = now + remainingSec
+                                gotTiming = true
+                            end
+                        end
+                    end)
+                end
+            end
+            
+            -- Even without timing, the aura IS active — use estimated duration
+            if not gotTiming then
+                duration = BASE_DURATIONS[spellKey] or 15
+                expirationTime = now + duration
+            end
+            
+            auraRawData[spellKey] = {
+                duration = duration,
+                expirationTime = expirationTime,
+                exists = true,
+                source = gotTiming and "API" or "estimated"
+            }
+            return auraData
         end
-        
-        -- Method 3: Use cached/estimated values
-        if not gotTiming then
-            duration = Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
-            expirationTime = now + duration  -- Estimate: just applied
-        end
-        
-        -- Cache duration if we got a real value
-        if duration and duration > 0 then
-            Shredded_cachedDurations.player[spellKey] = duration
-        end
-        
-        -- Update tracking
-        Shredded_selfTrack.player[spellKey] = {
-            startTime = expirationTime - duration,
-            duration = duration,
-            expirationTime = expirationTime,
-            lastSeen = now,
-            fromAPI = true
-        }
-        auraRawData[spellKey] = {
-            duration = duration,
-            expirationTime = expirationTime,
-            exists = true,
-            source = gotTiming and "API" or "estimated"
-        }
-        return auraData
     end
     
-    -- AURA NOT FOUND - we already checked instanceID cache at the top
-    -- Not found - but preserve test data if in test mode
+    -- Not found - preserve test data if in test mode
     if Shredded_TestMode and auraRawData[spellKey] and auraRawData[spellKey].source == "TEST" then
         return { spellId = spellId, testMode = true }
     end
     
     auraRawData[spellKey] = nil
-    Shredded_selfTrack.player[spellKey] = nil
     return nil
 end
 
@@ -1824,47 +2074,24 @@ local function FindTargetDebuff(spellKey)
     
     -- Check if target exists
     if not UnitExists("target") then
-        -- Preserve test data if in test mode
         if not (Shredded_TestMode and auraRawData[spellKey] and auraRawData[spellKey].source == "TEST") then
             auraRawData[spellKey] = nil
         end
         return nil
     end
     
-    -- Check for target change - invalidate cache for different target
+    -- Check for target change - invalidate tracking for different target
     local currentTargetGUID = UnitGUID("target")
     if currentTargetGUID ~= Shredded_lastTargetGUID then
-        -- Target changed - check if selfData is for this target
         if selfData and selfData.targetGUID and selfData.targetGUID ~= currentTargetGUID then
             Shredded_selfTrack.target[spellKey] = nil
             selfData = nil
         end
     end
     
-    -- PRIMARY: Use self-tracked data (most reliable in Midnight combat)
-    if selfData and selfData.expirationTime then
-        if selfData.expirationTime > now then
-            auraRawData[spellKey] = {
-                duration = selfData.duration,
-                expirationTime = selfData.expirationTime,
-                exists = true,
-                source = selfData.fromCLEU and "CLEU" or "tracked"
-            }
-            return { spellId = spellId, selfTracked = true }
-        else
-            -- Expired - clear tracking
-            Shredded_selfTrack.target[spellKey] = nil
-        end
-    end
-    
-    -- SECONDARY: Try multiple API lookup methods for debuffs
-    local spellName = SPELL_NAMES[spellKey]
-    local spellData = ACTIVE_SPELLS[spellKey]
-    local auraData = nil
-    
-    -- Build list of spell IDs to check (primary + debuffId + alternates)
+    -- Build list of IDs to check (primary + debuffId + alternates)
     local idsToCheck = {spellId}
-    -- Add explicit debuffId if different from primary id (e.g., Frantic Frenzy)
+    local spellData = ACTIVE_SPELLS[spellKey] or Shredded_SpellMeta[spellKey]
     if spellData and spellData.debuffId and spellData.debuffId ~= spellId then
         table.insert(idsToCheck, spellData.debuffId)
     end
@@ -1874,130 +2101,140 @@ local function FindTargetDebuff(spellKey)
         end
     end
     
-    -- Method 1: Iterate through debuffs using modern C_UnitAuras API
-    if not auraData then
-        local function CheckDebuff(aura)
-            if not aura then return end
-            -- Extract spellId safely (may be secret value)
-            local auraSpellId = nil
-            pcall(function()
-                auraSpellId = tonumber(string.format("%d", aura.spellId))
-            end)
-            
-            -- Check source separately - may be secret in combat
-            local isPlayerSource = false
-            local sourceUnknown = false
-            pcall(function()
-                local src = aura.sourceUnit
-                local fromPet = aura.isFromPlayerOrPlayerPet
-                if src == "player" or fromPet == true then
-                    isPlayerSource = true
-                elseif src == nil and fromPet == nil then
-                    -- Source info not available - may be secret
-                    sourceUnknown = true
+    -- PRIORITY 1: CDM Viewer-based lookup (works in combat with secret values!)
+    -- KEY: If viewerInstId is non-nil, the aura IS active. Timing is best-effort.
+    for _, checkId in ipairs(idsToCheck) do
+        local viewerFrame = Shredded_viewerAuraFrames[checkId]
+        if viewerFrame then
+            local viewerInstId = viewerFrame.auraInstanceID
+            if viewerInstId then
+                local unit = viewerFrame.auraDataUnit or "target"
+                if unit == "target" then
+                    -- Aura IS active — try timing (best-effort)
+                    local remainingSec, totalDurationSec = nil, nil
+                    local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, unit, viewerInstId)
+                    if ok and durationObj then
+                        remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                    end
+                    if not remainingSec and viewerFrame.Cooldown then
+                        local startMs, durMs = viewerFrame.Cooldown:GetCooldownTimes()
+                        pcall(function()
+                            if durMs and durMs > 0 then
+                                local endMs = startMs + durMs
+                                if endMs > now * 1000 then
+                                    remainingSec = (endMs - now * 1000) / 1000
+                                    totalDurationSec = durMs / 1000
+                                end
+                            end
+                        end)
+                    end
+                    local duration = totalDurationSec or BASE_DURATIONS[spellKey] or 15
+                    local expTime = remainingSec and (now + remainingSec) or (now + duration)
+                    auraRawData[spellKey] = {
+                        duration = duration,
+                        expirationTime = expTime,
+                        exists = true,
+                        source = remainingSec and "CDM_viewer" or "CDM_active"
+                    }
+                    Shredded_selfTrack.target[spellKey] = {
+                        startTime = expTime - duration,
+                        duration = duration,
+                        expirationTime = expTime,
+                        lastSeen = now,
+                        targetGUID = currentTargetGUID,
+                        fromAPI = true
+                    }
+                    return { spellId = checkId, auraInstanceID = viewerInstId }
                 end
-            end)
-            
-            -- Check against all possible spell IDs
-            if auraSpellId then
-                for _, checkId in ipairs(idsToCheck) do
-                    if auraSpellId == checkId then
-                        -- For matching spell ID, accept if player source confirmed
-                        -- OR if source is unknown (likely secret) since these are specific debuffs
-                        if isPlayerSource or sourceUnknown then
-                            auraData = aura
-                            return true  -- Stop iteration
-                        end
+            end
+            -- NOTE: Do NOT use Cooldown widget as fallback detection.
+            -- Cooldown:GetCooldownTimes() retains stale data from previously-active
+            -- debuffs, causing false positives. Only auraInstanceID is reliable.
+        end
+    end
+    
+    -- PRIORITY 2: Self-tracked data from spellcast events (secondary debuffs)
+    if selfData and selfData.expirationTime then
+        if selfData.expirationTime > now then
+            auraRawData[spellKey] = {
+                duration = selfData.duration,
+                expirationTime = selfData.expirationTime,
+                exists = true,
+                source = "tracked"
+            }
+            return { spellId = spellId, selfTracked = true }
+        else
+            Shredded_selfTrack.target[spellKey] = nil
+        end
+    end
+    
+    -- PRIORITY 3: Direct API lookup (works better out of combat)
+    local auraData = nil
+    local function CheckDebuff(aura)
+        if not aura then return end
+        local auraSpellId = nil
+        pcall(function()
+            auraSpellId = tonumber(string.format("%d", aura.spellId))
+        end)
+        local isPlayerSource = false
+        local sourceUnknown = false
+        pcall(function()
+            local src = aura.sourceUnit
+            local fromPet = aura.isFromPlayerOrPlayerPet
+            if src == "player" or fromPet == true then
+                isPlayerSource = true
+            elseif src == nil and fromPet == nil then
+                sourceUnknown = true
+            end
+        end)
+        if auraSpellId then
+            for _, checkId in ipairs(idsToCheck) do
+                if auraSpellId == checkId then
+                    if isPlayerSource or sourceUnknown then
+                        auraData = aura
+                        return true
                     end
                 end
             end
         end
-        AuraUtil.ForEachAura("target", "HARMFUL", nil, CheckDebuff, true)
     end
-    
-    -- Method 2: Try direct spell name lookup
-    if not auraData and spellName then
-        local tempAura = C_UnitAuras.GetAuraDataBySpellName("target", spellName, "HARMFUL")
-        if tempAura then
-            local isPlayerSource = false
-            local sourceUnknown = false
-            pcall(function()
-                local src = tempAura.sourceUnit
-                local fromPet = tempAura.isFromPlayerOrPlayerPet
-                if src == "player" or fromPet == true then
-                    isPlayerSource = true
-                elseif src == nil and fromPet == nil then
-                    sourceUnknown = true
-                end
-            end)
-            -- Accept if player source or source is unknown (likely secret)
-            if isPlayerSource or sourceUnknown then
-                auraData = tempAura
-            end
-        end
-    end
+    AuraUtil.ForEachAura("target", "HARMFUL", nil, CheckDebuff, true)
     
     if auraData then
         local duration = nil
         local expirationTime = nil
         local gotTiming = false
-        local timingSource = "none"
         
-        -- Method 1: Try direct numeric extraction (works outside restricted combat)
         pcall(function()
             local d = auraData.duration
             local e = auraData.expirationTime
-            -- Try arithmetic to verify values aren't secret
-            local timeUntilExpire = e - now
-            if timeUntilExpire > -1000 and timeUntilExpire < 10000 then  -- Sanity check
+            local test = e - now
+            if test > -1000 and test < 10000 then
                 duration = d
                 expirationTime = e
                 gotTiming = true
-                timingSource = "direct"
             end
         end)
         
-        -- Method 2: Use GetAuraDuration with auraInstanceID + widget decoder (CooldownCompanion approach)
         if not gotTiming and auraData.auraInstanceID then
             pcall(function()
                 local durationObj = C_UnitAuras.GetAuraDuration("target", auraData.auraInstanceID)
                 if durationObj then
                     local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
                     if remainingSec and remainingSec > 0 then
-                        duration = totalDurationSec or Shredded_cachedDurations.target[spellKey] or BASE_DURATIONS[spellKey] or 15
+                        duration = totalDurationSec or BASE_DURATIONS[spellKey] or 15
                         expirationTime = now + remainingSec
                         gotTiming = true
-                        timingSource = "decoder"
                     end
                 end
             end)
         end
         
-        -- Method 3: Fall back to cached/base durations
         if not gotTiming then
-            -- Try to extract just the duration value if possible
-            pcall(function()
-                duration = tonumber(string.format("%.2f", auraData.duration))
-            end)
-            
-            if not duration or duration <= 0 then
-                duration = Shredded_cachedDurations.target[spellKey] or BASE_DURATIONS[spellKey] or 15
-            end
-            
-            -- Use self-tracked expiration if available, otherwise estimate
-            if selfData and selfData.expirationTime and selfData.expirationTime > now then
-                expirationTime = selfData.expirationTime
-            else
-                expirationTime = now + duration
-            end
+            duration = BASE_DURATIONS[spellKey] or 15
+            expirationTime = now + duration
         end
         
-        -- Cache readable durations for future use
-        if duration and duration > 0 then
-            Shredded_cachedDurations.target[spellKey] = duration
-        end
-        
-        -- Update tracking with target GUID
         Shredded_selfTrack.target[spellKey] = {
             startTime = expirationTime - duration,
             duration = duration,
@@ -2010,18 +2247,12 @@ local function FindTargetDebuff(spellKey)
             duration = duration,
             expirationTime = expirationTime,
             exists = true,
-            source = timingSource
+            source = gotTiming and "API" or "estimated"
         }
-        
-        -- Debug: Show timing source for secondary debuffs
-        if spellKey == "DREADFUL_WOUND" or spellKey == "INFECTED_WOUNDS" then
-            ShreddedV(spellKey .. " timing: " .. timingSource .. " dur=" .. string.format("%.1f", duration) .. " rem=" .. string.format("%.1f", expirationTime - now))
-        end
-        
         return auraData
     end
     
-    -- In combat fallback - trust tracking if API fails
+    -- Combat fallback - trust tracking if API fails
     if inCombat and selfData and selfData.expirationTime and selfData.expirationTime > now then
         auraRawData[spellKey] = {
             duration = selfData.duration,
@@ -2032,7 +2263,7 @@ local function FindTargetDebuff(spellKey)
         return { spellId = spellId, selfTracked = true }
     end
     
-    -- Not found - but preserve test data if in test mode
+    -- Not found
     if Shredded_TestMode and auraRawData[spellKey] and auraRawData[spellKey].source == "TEST" then
         return { spellId = spellId, testMode = true }
     end
@@ -2706,6 +2937,12 @@ C_Timer.After(0, function()
     InitializeAddon()
     StartPolling()
     StartEventHandler()  -- Start event monitoring for aura/spell updates
+    -- Step 1: Ensure CDM viewers are shown (alpha=0) so Blizzard populates children
+    EnsureViewersShown()
+    -- Step 2: Wait for Blizzard to populate cooldownInfo on viewer children (needs ~1s)
+    C_Timer.After(1, function()
+        BuildViewerAuraMap()
+    end)
 end)
 
 -- Event Handler - uses standard WoW events for tracking
@@ -2721,6 +2958,9 @@ function StartEventHandler()
     eventFrame:RegisterEvent("SPELL_UPDATE_COOLDOWN")     -- Cooldown changes
     eventFrame:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_SHOW")  -- Proc glow shown
     eventFrame:RegisterEvent("SPELL_ACTIVATION_OVERLAY_GLOW_HIDE")  -- Proc glow hidden
+    eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")  -- Spec change - rebuild viewer map
+    eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")  -- Login/reload/instance - rebuild viewer map
+    eventFrame:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")  -- CDM spell override change
     
     eventFrame:SetScript("OnEvent", function(self, event, ...)
         local now = GetTime()
@@ -2833,191 +3073,9 @@ function StartEventHandler()
             end
             
         elseif event == "UNIT_AURA" then
-            local unit, updateInfo = ...
-            if unit == "player" then
-                isDirty = true  -- Mark for update, OnUpdate will poll auras
-                
-                -- CRITICAL: Capture auraInstanceID from the event (like CooldownCompanion)
-                -- This is how we track auras when spellId is secret!
-                if updateInfo then
-                    -- Process removed auras first
-                    if updateInfo.removedAuraInstanceIDs then
-                        for _, instId in ipairs(updateInfo.removedAuraInstanceIDs) do
-                            -- Find and clear any tracked aura with this instanceID
-                            for spellKey, cachedInstId in pairs(Shredded_auraInstanceCache) do
-                                if cachedInstId == instId then
-                                    Shredded_auraInstanceCache[spellKey] = nil
-                                    auraRawData[spellKey] = nil
-                                    ShreddedV("Aura REMOVED: " .. spellKey .. " (inst:" .. instId .. ")")
-                                end
-                            end
-                        end
-                    end
-                    
-                    -- Process added auras - collect unmatched instanceIDs
-                    local unmatchedInstIds = {}
-                    if updateInfo.addedAuras then
-                        for _, auraData in ipairs(updateInfo.addedAuras) do
-                            local instId = auraData.auraInstanceID
-                            if instId then
-                                -- Try to read spellId (may be secret)
-                                local spellId = nil
-                                pcall(function()
-                                    local test = auraData.spellId == 0  -- Will fail if secret
-                                    spellId = auraData.spellId
-                                end)
-                                
-                                if spellId then
-                                    -- spellId is readable - match to our tracked spells
-                                    local spellKey = SPELL_ID_TO_KEY[spellId]
-                                    if spellKey then
-                                        Shredded_auraInstanceCache[spellKey] = instId
-                                        ShreddedV("Aura ADDED: " .. spellKey .. " (ID:" .. spellId .. ", inst:" .. instId .. ")")
-                                        
-                                        -- Get duration using widget decoder (returns seconds)
-                                        pcall(function()
-                                            local durationObj = C_UnitAuras.GetAuraDuration("player", instId)
-                                            if durationObj then
-                                                local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-                                                local duration = totalDurationSec or Shredded_cachedDurations.player[spellKey] or BASE_DURATIONS[spellKey] or 15
-                                                local remaining = remainingSec or duration
-                                                auraRawData[spellKey] = {
-                                                    duration = duration,
-                                                    expirationTime = GetTime() + remaining,
-                                                    exists = true,
-                                                    source = "UNIT_AURA_event"
-                                                }
-                                            end
-                                        end)
-                                    end
-                                else
-                                    -- spellId is SECRET - pool for matching
-                                    table.insert(unmatchedInstIds, instId)
-                                    ShreddedV("Aura ADDED (secret ID): inst:" .. instId)
-                                end
-                            end
-                        end
-                    end
-                    
-                    -- Try to match unmatched instanceIDs to our tracked procs
-                    -- PRIORITY 1: Match to procs that are "pending" from glow hints
-                    -- PRIORITY 2: Match by duration similarity
-                    if #unmatchedInstIds > 0 then
-                        local now = GetTime()
-                        local consumed = {}  -- Track which instanceIDs we've assigned
-                        local DURATION_TOLERANCE = 2  -- seconds - only match if within this tolerance
-                        
-                        -- FIRST: Try to match pending procs (from glow hints) - still use strict duration matching
-                        for procKey, pendingInfo in pairs(Shredded_pendingProcs) do
-                            if not Shredded_auraInstanceCache[procKey] and (now - pendingInfo.time) < PENDING_PROC_WINDOW then
-                                local expectedDur = Shredded_cachedDurations.player[procKey] or BASE_DURATIONS[procKey]
-                                
-                                -- Skip if no expected duration
-                                if expectedDur and expectedDur > 0 then
-                                    local bestInstId, bestScore, bestRemaining, bestDuration = nil, nil, nil, nil
-                                    
-                                    for _, instId in ipairs(unmatchedInstIds) do
-                                        if not consumed[instId] then
-                                            local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", instId)
-                                            if ok and durationObj then
-                                                local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-                                                if totalDurationSec and totalDurationSec > 0 then
-                                                    local dist = math.abs(totalDurationSec - expectedDur)
-                                                    -- Only match if within tolerance
-                                                    if dist <= DURATION_TOLERANCE then
-                                                        if not bestScore or dist < bestScore then
-                                                            bestScore = dist
-                                                            bestInstId = instId
-                                                            bestRemaining = remainingSec
-                                                            bestDuration = totalDurationSec
-                                                        end
-                                                    end
-                                                end
-                                            end
-                                        end
-                                    end
-                                    
-                                    if bestInstId and bestRemaining and bestDuration then
-                                        Shredded_auraInstanceCache[procKey] = bestInstId
-                                        auraRawData[procKey] = {
-                                            duration = bestDuration,
-                                            expirationTime = now + bestRemaining,
-                                            exists = true,
-                                            source = "pending_match"
-                                        }
-                                        consumed[bestInstId] = true
-                                        Shredded_pendingProcs[procKey] = nil  -- Clear pending
-                                        ShreddedV("PENDING MATCHED: " .. procKey .. " (inst:" .. bestInstId .. ", dur:" .. string.format("%.1f", bestDuration) .. "s)")
-                                    end
-                                end
-                            end
-                        end
-                        
-                        -- SECOND: Try to match remaining procs by duration - STRICT MATCHING ONLY
-                        -- Only match if duration is very close to expected (within 2 seconds)
-                        -- SKIP procs that have glow mappings - they should ONLY match via glow hints
-                        -- This prevents CLEARCASTING from stealing COILED_TO_SPRING's 15s aura
-                        local DURATION_TOLERANCE = 2  -- seconds
-                        
-                        for _, procKey in ipairs(ShreddedCooldownSpells) do
-                            if not Shredded_auraInstanceCache[procKey] then
-                                -- SKIP procs that have glow mappings - they must match via glow hints only
-                                if PROC_HAS_GLOW[procKey] then
-                                    -- This proc has glow mappings, skip duration matching
-                                    -- It will only be matched when its ability glows
-                                else
-                                    local expectedDur = Shredded_cachedDurations.player[procKey] or BASE_DURATIONS[procKey]
-                                    
-                                    -- SKIP if we don't have an expected duration - can't match safely
-                                    if not expectedDur or expectedDur <= 0 then
-                                        -- Skip this proc - no reliable matching possible
-                                    else
-                                        local bestInstId, bestScore, bestRemaining, bestDuration = nil, nil, nil, nil
-                                        
-                                        for _, instId in ipairs(unmatchedInstIds) do
-                                            if not consumed[instId] then
-                                                -- Use widget decoder to extract duration (returns seconds)
-                                                local ok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", instId)
-                                                if ok and durationObj then
-                                                    local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-                                                    if totalDurationSec and totalDurationSec > 0 then
-                                                        -- Only consider if duration is within tolerance
-                                                        local dist = math.abs(totalDurationSec - expectedDur)
-                                                        if dist <= DURATION_TOLERANCE then
-                                                            if not bestScore or dist < bestScore then
-                                                                bestScore = dist
-                                                                bestInstId = instId
-                                                                bestRemaining = remainingSec
-                                                                bestDuration = totalDurationSec
-                                                            end
-                                                        end
-                                                    end
-                                                end
-                                            end
-                                        end
-                                        
-                                        if bestInstId and bestRemaining and bestDuration then
-                                            Shredded_auraInstanceCache[procKey] = bestInstId
-                                            auraRawData[procKey] = {
-                                                duration = bestDuration,
-                                                expirationTime = now + bestRemaining,
-                                                exists = true,
-                                                source = "duration_match"
-                                            }
-                                            consumed[bestInstId] = true
-                                            ShreddedV("Aura MATCHED: " .. procKey .. " (inst:" .. bestInstId .. ", dur:" .. string.format("%.1f", bestDuration) .. "s, expected:" .. expectedDur .. "s)")
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-                
-                -- Log any proc-like buffs for debugging
-                ScanAndLogProcs()
-            elseif unit == "target" then
-                isDirty = true
+            local unit = ...
+            if unit == "player" or unit == "target" then
+                isDirty = true  -- Mark for update; FindPlayerAura/FindTargetDebuff will query CDM viewers
             end
             
         elseif event == "PLAYER_TARGET_CHANGED" then
@@ -3031,87 +3089,68 @@ function StartEventHandler()
             end
             
         elseif event == "PLAYER_REGEN_ENABLED" then
-            -- Left combat - clear CLEU data
+            -- Left combat - clear CLEU data, rebuild viewer map
             wipe(Shredded_cleuAuras.player)
             wipe(Shredded_cleuAuras.target)
-            isDirty = true  -- Force refresh
+            BuildViewerAuraMap()  -- Rebuild in case CDM layout changed
+            isDirty = true
+            
+        elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+            -- Spec changed - rebuild viewer map after a short delay
+            C_Timer.After(0.5, function()
+                BuildViewerAuraMap()
+                ShreddedV("Spec changed - viewer map rebuilt")
+            end)
+            isDirty = true
+            
+        elseif event == "PLAYER_ENTERING_WORLD" then
+            -- Login/reload/instance change - ensure viewers shown, rebuild after CDM populates
+            EnsureViewersShown()
+            C_Timer.After(1, function()
+                BuildViewerAuraMap()
+                ShreddedV("PLAYER_ENTERING_WORLD - viewer map rebuilt")
+            end)
+            isDirty = true
             
         elseif event == "SPELL_UPDATE_COOLDOWN" then
-            isDirty = true  -- Mark for update
+            isDirty = true
             
         elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_SHOW" then
-            -- Proc glow appeared - this is our BEST HINT for proc detection!
-            -- The glow appears on the ability you can use (e.g., Shred), not the proc buff
+            -- Just log for debugging - CDM handles the actual aura tracking
             local glowSpellId = ...
             ShreddedV("Proc GLOW_SHOW: " .. tostring(glowSpellId))
-            
-            -- Log for debugging
             if glowSpellId and type(glowSpellId) == "number" then
                 local spellName = C_Spell.GetSpellName(glowSpellId)
                 LogProc(spellName or ("Unknown_" .. glowSpellId), glowSpellId, true)
-                
-                -- CRITICAL: Mark the corresponding proc as "pending" for aura matching
-                local procKey = GLOW_TO_PROC[glowSpellId]
-                if procKey then
-                    Shredded_pendingProcs[procKey] = { time = now }
-                    ShreddedV("GLOW HINT: Expecting " .. procKey .. " proc!")
-                    
-                    -- Immediately try to find any unmatched recent aura to assign
-                    -- Check if we have any unassigned instanceIDs from recent UNIT_AURA events
-                    if not Shredded_auraInstanceCache[procKey] then
-                        -- Scan current buffs to find the proc (it should have just been applied)
-                        for i = 1, 40 do
-                            local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
-                            if not aura then break end
-                            local instId = aura.auraInstanceID
-                            if instId and not Shredded_auraInstanceCache[procKey] then
-                                -- Try to decode duration (returns seconds)
-                                local durationObj = nil
-                                pcall(function()
-                                    durationObj = C_UnitAuras.GetAuraDuration("player", instId)
-                                end)
-                                if durationObj then
-                                    local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-                                    local expectedDur = BASE_DURATIONS[procKey] or 15
-                                    -- Check if this matches expected duration (within 50%)
-                                    if totalDurationSec and totalDurationSec > 0 and remainingSec then
-                                        local diff = math.abs(totalDurationSec - expectedDur)
-                                        if diff < expectedDur * 0.5 then
-                                            -- This is likely our proc!
-                                            Shredded_auraInstanceCache[procKey] = instId
-                                            auraRawData[procKey] = {
-                                                duration = totalDurationSec,
-                                                expirationTime = now + remainingSec,
-                                                exists = true,
-                                                source = "glow_hint"
-                                            }
-                                            ShreddedV("GLOW MATCHED: " .. procKey .. " to inst:" .. instId .. " rem:" .. string.format("%.1f", remainingSec))
-                                            break
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
             end
             isDirty = true
             
         elseif event == "SPELL_ACTIVATION_OVERLAY_GLOW_HIDE" then
-            -- Proc glow hidden - the proc was consumed or expired
-            local glowSpellId = ...
-            ShreddedV("Proc GLOW_HIDE: " .. tostring(glowSpellId))
+            ShreddedV("Proc GLOW_HIDE: " .. tostring(...))
+            isDirty = true
             
-            -- Clear the pending proc hint
-            if glowSpellId and type(glowSpellId) == "number" then
-                local procKey = GLOW_TO_PROC[glowSpellId]
-                if procKey then
-                    Shredded_pendingProcs[procKey] = nil
-                    -- Don't clear auraRawData here - let the UNIT_AURA removal handle that
+        elseif event == "COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED" then
+            -- A CDM viewer child's spell was overridden (e.g. Eclipse transform)
+            -- Do an incremental map update like CooldownCompanion does
+            local baseSpellID, overrideSpellID = ...
+            if baseSpellID then
+                local child = Shredded_viewerAuraFrames[baseSpellID]
+                if child and overrideSpellID then
+                    Shredded_viewerAuraFrames[overrideSpellID] = child
                 end
             end
             isDirty = true
         end
+    end)
+    
+    -- Register for CDM layout changes to rebuild viewer map
+    pcall(function()
+        EventRegistry:RegisterCallback("CooldownViewerSettings.OnDataChanged", function()
+            C_Timer.After(0.2, function()
+                BuildViewerAuraMap()
+                ShreddedV("CDM layout changed - viewer map rebuilt")
+            end)
+        end, "Shredded_CDM_Watcher")
     end)
 end
 
@@ -3674,79 +3713,99 @@ function FullFrameUpdate()
                     local isCooldown = spellMeta and spellMeta.isCooldown
                     local spellId = spellMeta and spellMeta.id
                     
-                    -- PRIORITY 1: Check event-captured auraInstanceCache (works in combat with secret values!)
-                    -- PRIORITY 2: Check GetPlayerAuraBySpellID (works out of combat)
+                    -- PRIORITY 1: CDM Viewer (works in combat - spellID is always readable!)
+                    -- PRIORITY 2: GetPlayerAuraBySpellID (fallback for out-of-combat)
                     -- PRIORITY 3: Check overlay (spell glow)
                     local auraData = nil
                     local auraInstanceID = nil
                     local isAuraActive = false
                     local remaining = 0
                     
-                    -- PRIORITY 1: Check event-captured instance cache (works with secret values in combat!)
-                    if Shredded_auraInstanceCache and Shredded_auraInstanceCache[spell] then
-                        auraInstanceID = Shredded_auraInstanceCache[spell]
-                        isAuraActive = true
-                        
-                        -- Get remaining time via widget decoder
-                        local dok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", auraInstanceID)
-                        if dok and durationObj then
-                            local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
-                            if remainingSec and remainingSec > 0 then
-                                remaining = remainingSec
-                            else
-                                -- Duration object returned 0 - aura may have expired, clear cache
-                                Shredded_auraInstanceCache[spell] = nil
-                                isAuraActive = false
-                                auraInstanceID = nil
+                    -- PRIORITY 1: CDM Viewer lookup (like CooldownCompanion)
+                    if spellId then
+                        local viewerFrame = Shredded_viewerAuraFrames[spellId]
+                        -- Also check altIds in viewer map
+                        if not viewerFrame and spellMeta and spellMeta.altIds then
+                            for _, altId in ipairs(spellMeta.altIds) do
+                                viewerFrame = Shredded_viewerAuraFrames[altId]
+                                if viewerFrame then break end
                             end
-                        else
-                            -- GetAuraDuration failed - aura may have been removed
-                            Shredded_auraInstanceCache[spell] = nil
-                            isAuraActive = false
-                            auraInstanceID = nil
+                        end
+                        
+                        if viewerFrame then
+                            -- auraInstanceID is nil when inactive, non-nil when active
+                            local instId = viewerFrame.auraInstanceID
+                            
+                            -- Detailed combat log for CLEARCASTING only (first few ticks)
+                            if spell == "CLEARCASTING" and Shredded_CombatLogEnabled then
+                                Shredded_ccLogCount = (Shredded_ccLogCount or 0) + 1
+                                if Shredded_ccLogCount <= 10 or (instId and Shredded_ccLogCount % 20 == 0) then
+                                    local parentName = viewerFrame:GetParent() and viewerFrame:GetParent():GetName() or "?"
+                                    local isVis = viewerFrame:IsVisible() and "vis" or "hid"
+                                    local isActive = viewerFrame.isActive and "Y" or "N"
+                                    print("|cFF88FFFF[CDM]|r CC tick#" .. Shredded_ccLogCount .. " instId=" .. tostring(instId) .. " active=" .. isActive .. " " .. isVis .. " parent=" .. parentName)
+                                end
+                            end
+                            
+                            if instId then
+                                auraInstanceID = instId
+                                isAuraActive = true
+                                
+                                -- Get remaining time (best-effort, not required for detection)
+                                local dok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", instId)
+                                if dok and durationObj then
+                                    local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
+                                    if remainingSec and remainingSec > 0 then
+                                        remaining = remainingSec
+                                    end
+                                end
+                                -- If decode failed, try viewer's Cooldown widget for timing
+                                if remaining <= 0 and viewerFrame.Cooldown then
+                                    pcall(function()
+                                        local startMs, durMs = viewerFrame.Cooldown:GetCooldownTimes()
+                                        if durMs and durMs > 0 then
+                                            local endMs = startMs + durMs
+                                            local nowMs = GetTime() * 1000
+                                            if endMs > nowMs then
+                                                remaining = (endMs - nowMs) / 1000
+                                            end
+                                        end
+                                    end)
+                                end
+                            end
+                            -- NOTE: Do NOT use Cooldown widget as fallback detection.
+                            -- Cooldown:GetCooldownTimes() retains stale data from previously-active
+                            -- procs, causing false positives. Only auraInstanceID is reliable.
                         end
                     end
                     
-                    -- PRIORITY 2: Check GetPlayerAuraBySpellID (fallback, works better out of combat)
+                    -- PRIORITY 2: GetPlayerAuraBySpellID (fallback for out-of-combat or if CDM viewer not populated)
+                    -- NOTE: Only check the primary buff ID here, NOT altIds.
+                    -- altIds contain talent/ability IDs (e.g. 16864 Omen of Clarity) that are
+                    -- passive auras ALWAYS on the player - checking them makes procs always show.
                     if not isAuraActive and spellId then
-                        -- GetPlayerAuraBySpellID returns nil or aura table
-                        -- Wrap in pcall in case secret value taints the return
                         local ok
                         ok, auraData = pcall(C_UnitAuras.GetPlayerAuraBySpellID, spellId)
                         if not ok then auraData = nil end
                         
-                        -- Also check altIds if primary not found
-                        if not auraData and spellMeta.altIds then
-                            for _, altId in ipairs(spellMeta.altIds) do
-                                ok, auraData = pcall(C_UnitAuras.GetPlayerAuraBySpellID, altId)
-                                if ok and auraData then break end
-                            end
-                        end
-                        
-                        -- Extract auraInstanceID (NeverSecret) safely
+                        -- If GetPlayerAuraBySpellID returned data, the aura IS active
+                        -- (auraInstanceID may be secret from this API, so don't gate on it)
                         if auraData then
+                            isAuraActive = true
+                            
+                            -- Try to extract auraInstanceID for timing (may be secret)
                             pcall(function()
                                 auraInstanceID = auraData.auraInstanceID
                             end)
-                        end
-                        
-                        -- If we have an auraInstanceID, the buff is active!
-                        if auraInstanceID then
-                            isAuraActive = true
-                            -- Cache it for future ticks
-                            if Shredded_auraInstanceCache then
-                                Shredded_auraInstanceCache[spell] = auraInstanceID
-                            end
                             
-                            -- Try to get remaining time - may be secret values in combat
+                            -- Try to get remaining time - may be secret in combat
                             local mathOk = pcall(function()
-                                local currentTime = GetTime()
-                                remaining = auraData.expirationTime - currentTime
+                                remaining = auraData.expirationTime - GetTime()
                                 if remaining < 0 then remaining = 0 end
                             end)
                             
-                            -- If arithmetic failed (secret values), use duration object via widget
-                            if not mathOk or remaining <= 0 then
+                            -- If arithmetic failed, try widget decoder with auraInstanceID
+                            if (not mathOk or remaining <= 0) and auraInstanceID then
                                 local dok, durationObj = pcall(C_UnitAuras.GetAuraDuration, "player", auraInstanceID)
                                 if dok and durationObj then
                                     local remainingSec, totalDurationSec = DecodeDurationObject(durationObj)
@@ -4115,7 +4174,14 @@ function Shredded_LoadFrames()
     end
     ShreddedSettings["cooldownlayout"]["width"] = ShreddedSettings["cooldownlayout"]["width"] or 4
     ShreddedSettings["cooldownlayout"]["height"] = ShreddedSettings["cooldownlayout"]["height"] or 3
-    ShreddedSettings["cooldownson"] = (ShreddedSettings["cooldownson"] ~= nil) and ShreddedSettings["cooldownson"] or (ShreddedSettings["catwarningson"] ~= nil and ShreddedSettings["catwarningson"]) or true
+    -- Migrate from old "catwarningson" to "cooldownson" (only if cooldownson hasn't been set yet)
+    if ShreddedSettings["cooldownson"] == nil then
+        if ShreddedSettings["catwarningson"] ~= nil then
+            ShreddedSettings["cooldownson"] = ShreddedSettings["catwarningson"]
+        else
+            ShreddedSettings["cooldownson"] = true
+        end
+    end
     ShreddedSettings["cooldowntime"] = ShreddedSettings["cooldowntime"] or ShreddedSettings["warntime"] or {}
     ShreddedSettings["cooldownon"] = ShreddedSettings["cooldownon"] or {}  -- Individual ability toggles
     

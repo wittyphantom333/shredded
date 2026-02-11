@@ -293,6 +293,144 @@ local function SetupSlashCommands()
                 ShreddedO("|cFFFF0000Combat log DISABLED|r")
             end
             
+        elseif msg == "cdm" then
+            -- Debug CDM viewer map - shows which spells are mapped to which viewer children
+            local lines = {"=== CDM Viewer Map Debug ===", ""}
+            
+            -- Check CDM CVar
+            local cdmCvar = GetCVar("cooldownViewerEnabled")
+            table.insert(lines, "CVar cooldownViewerEnabled = " .. tostring(cdmCvar))
+            table.insert(lines, "")
+            
+            -- Check if viewers exist
+            local viewerNames = {"EssentialCooldownViewer", "UtilityCooldownViewer", "BuffIconCooldownViewer", "BuffBarCooldownViewer"}
+            table.insert(lines, "Viewer Frames:")
+            for _, name in ipairs(viewerNames) do
+                local viewer = _G[name]
+                if viewer then
+                    local children = {viewer:GetChildren()}
+                    local hasCooldownInfo = 0
+                    local noCooldownInfo = 0
+                    for _, child in pairs(children) do
+                        if child.cooldownInfo then
+                            hasCooldownInfo = hasCooldownInfo + 1
+                        else
+                            noCooldownInfo = noCooldownInfo + 1
+                        end
+                    end
+                    table.insert(lines, "  " .. name .. ": " .. #children .. " children (" .. hasCooldownInfo .. " with cooldownInfo, " .. noCooldownInfo .. " without)")
+                    
+                    -- Show all children (with or without cooldownInfo)
+                    for i, child in ipairs(children) do
+                        if child.cooldownInfo then
+                            local sid = child.cooldownInfo.spellID or "nil"
+                            local oid = child.cooldownInfo.overrideSpellID
+                            local tid = child.cooldownInfo.overrideTooltipSpellID
+                            local instId = child.auraInstanceID
+                            local aUnit = child.auraDataUnit
+                            local hasCd = child.Cooldown and "Y" or "N"
+                            local vis = child:IsVisible() and "vis" or "hid"
+                            local spellName = ""
+                            if type(sid) == "number" then
+                                pcall(function() spellName = C_Spell.GetSpellName(sid) or "" end)
+                            end
+                            local extra = ""
+                            if oid then extra = extra .. " override=" .. oid end
+                            if tid then extra = extra .. " tooltip=" .. tid end
+                            if instId then extra = extra .. " instID=" .. tostring(instId) end
+                            if aUnit then extra = extra .. " unit=" .. aUnit end
+                            table.insert(lines, "    [" .. i .. "] ID:" .. tostring(sid) .. " (" .. spellName .. ") CD:" .. hasCd .. " " .. vis .. extra)
+                        else
+                            -- No cooldownInfo - dump what we CAN see
+                            local childName = child:GetName() or "unnamed"
+                            local childType = child:GetObjectType() or "?"
+                            local vis = child:IsVisible() and "vis" or "hid"
+                            local hasCd = child.Cooldown and "Y" or "N"
+                            -- Enumerate known/common keys
+                            local keys = {}
+                            for k, v in pairs(child) do
+                                if type(k) == "string" and k ~= "0" then
+                                    local vtype = type(v)
+                                    if vtype == "number" or vtype == "string" or vtype == "boolean" then
+                                        table.insert(keys, k .. "=" .. tostring(v))
+                                    elseif vtype == "table" then
+                                        table.insert(keys, k .. "={...}")
+                                    elseif vtype == "function" then
+                                        -- skip functions
+                                    else
+                                        table.insert(keys, k .. "=<" .. vtype .. ">")
+                                    end
+                                end
+                            end
+                            local keyStr = #keys > 0 and (" keys: " .. table.concat(keys, ", ")) or " (no custom keys)"
+                            table.insert(lines, "    [" .. i .. "] NO cooldownInfo | name=" .. childName .. " type=" .. childType .. " CD:" .. hasCd .. " " .. vis .. keyStr)
+                        end
+                    end
+                else
+                    table.insert(lines, "  " .. name .. ": NOT FOUND (global is nil)")
+                end
+            end
+            
+            table.insert(lines, "")
+            table.insert(lines, "Shredded_viewerAuraFrames (our tracked spells):")
+            if Shredded_viewerAuraFrames then
+                for _, key in ipairs(ShreddedCooldownSpells) do
+                    local meta = Shredded_SpellMeta and Shredded_SpellMeta[key]
+                    local id = meta and meta.id
+                    if id then
+                        local child = Shredded_viewerAuraFrames[id]
+                        if child then
+                            local parentName = child:GetParent() and child:GetParent():GetName() or "?"
+                            local instId = child.auraInstanceID
+                            local aUnit = child.auraDataUnit
+                            local status = parentName
+                            if instId then status = status .. " instID=" .. tostring(instId) end
+                            if aUnit then status = status .. " unit=" .. aUnit end
+                            table.insert(lines, "  " .. key .. " (ID:" .. id .. ") -> " .. status)
+                        else
+                            -- Try to find via GetCooldownAuraBySpellID
+                            local auraId = nil
+                            pcall(function() auraId = C_UnitAuras.GetCooldownAuraBySpellID(id) end)
+                            local auraStr = auraId and auraId ~= 0 and (" auraID=" .. auraId) or ""
+                            table.insert(lines, "  " .. key .. " (ID:" .. id .. ") -> NOT MAPPED" .. auraStr)
+                        end
+                    end
+                end
+                -- Also check bar spells
+                table.insert(lines, "")
+                table.insert(lines, "Bar spells:")
+                if ShreddedCatSpells then
+                    for _, key in ipairs(ShreddedCatSpells) do
+                        local meta = Shredded_SpellMeta and Shredded_SpellMeta[key]
+                        local id = meta and meta.id
+                        if id then
+                            local child = Shredded_viewerAuraFrames[id]
+                            if child then
+                                local parentName = child:GetParent() and child:GetParent():GetName() or "?"
+                                local isBuff = parentName == "BuffIconCooldownViewer" or parentName == "BuffBarCooldownViewer"
+                                table.insert(lines, "  " .. key .. " (ID:" .. id .. ") -> " .. parentName .. (isBuff and " [BUFF]" or " [CD]"))
+                            else
+                                table.insert(lines, "  " .. key .. " (ID:" .. id .. ") -> NOT MAPPED")
+                            end
+                        end
+                    end
+                end
+            else
+                table.insert(lines, "  [Shredded_viewerAuraFrames is nil/empty!]")
+            end
+            
+            Shredded_ShowDebugPopup(table.concat(lines, "\n"))
+            
+        elseif msg == "rebuild" then
+            -- Force rebuild of CDM viewer map
+            if Shredded_RebuildViewerMap then
+                Shredded_viewerMapRetries = 0  -- Reset retry counter
+                Shredded_RebuildViewerMap()
+                ShreddedO("|cFF00FF00CDM viewer map rebuilt!|r Run /shredded cdm to check results.")
+            else
+                ShreddedO("|cFFFF0000BuildViewerAuraMap not available yet.|r")
+            end
+            
         elseif msg == "procs" then
             -- Debug proc detection - shows frame map status and detection
             local lines = {"=== Proc Icons Debug ===", ""}
